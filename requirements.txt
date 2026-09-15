@@ -3,4 +3,4 @@
 beautifulsoup4>=4.12,<5
 PyMuPDF>=1.23,<2
 psutil>=5.9,<8
-requests>=2.31,<3
+requests>=2.34.2,<3
