@@ -12,9 +12,13 @@ import pymupdf as fitz
 from evaluate_ocr import (
     aligned_pages,
     canonical_label,
+    geometry_compatibility,
     load_cascade,
     main as evaluate_ocr_main,
+    order_similarity,
+    order_similarity_details,
     page_ocr_blocks,
+    structure_scores,
     visual_description_labels,
 )
 from pdf_pipeline import (
@@ -618,6 +622,193 @@ class ChandraAdapterUnitTests(unittest.TestCase):
 
 
 class CascadeEvaluationUnitTests(unittest.TestCase):
+    def test_structure_scores_do_not_count_unrelated_same_type_blocks(self) -> None:
+        reference_blocks = [
+            {
+                "type": "paragraph",
+                "text": "First unique reference paragraph",
+                "bbox": [0, 0, 100, 20],
+            },
+            {
+                "type": "paragraph",
+                "text": "Second unique reference paragraph",
+                "bbox": [0, 30, 100, 50],
+            },
+        ]
+        ocr_blocks = [
+            {
+                "label": "Text",
+                "text": "Completely unrelated OCR noise",
+                "bbox": [200, 0, 300, 20],
+            },
+            {
+                "label": "Text",
+                "text": "Another unrelated OCR region",
+                "bbox": [200, 30, 300, 50],
+            },
+        ]
+
+        scores = structure_scores(reference_blocks, ocr_blocks)
+        paragraph = scores["per_type"]["paragraph"]
+
+        # The old count-only metric would have reported F1=1.0 here.
+        self.assertEqual(paragraph["matched"], 0)
+        self.assertEqual(paragraph["precision"], 0.0)
+        self.assertEqual(paragraph["recall"], 0.0)
+        self.assertEqual(paragraph["f1"], 0.0)
+        self.assertEqual(scores["matching"]["reference_match_coverage"], 0.0)
+        self.assertEqual(scores["matching"]["ocr_match_coverage"], 0.0)
+
+    def test_structure_scores_accept_text_or_geometry_evidence(self) -> None:
+        page_geometry = {
+            "coordinate_space": "pdf_points",
+            "coordinate_frame": "pdf_page_points_top_left_unrotated",
+            "page_bbox": [0, 0, 300, 100],
+        }
+        reference_blocks = [
+            {
+                "type": "section_heading",
+                "text": "Correct heading",
+                "bbox": [0, 0, 100, 20],
+                "geometry": dict(page_geometry),
+            },
+            {
+                "type": "paragraph",
+                "text": "Text damaged in OCR",
+                "bbox": [0, 30, 100, 50],
+                "geometry": dict(page_geometry),
+            },
+        ]
+        ocr_blocks = [
+            {
+                "label": "SectionHeader",
+                "text": "Correct heading",
+                "bbox": [200, 0, 300, 20],
+                "geometry": dict(page_geometry),
+            },
+            {
+                "label": "Text",
+                "text": "garbled",
+                "bbox": [0, 30, 100, 50],
+                "geometry": dict(page_geometry),
+            },
+        ]
+
+        scores = structure_scores(reference_blocks, ocr_blocks)
+        matches = scores["matching"]["matches"]
+
+        self.assertEqual(scores["per_type"]["section_heading"]["f1"], 1.0)
+        self.assertEqual(scores["per_type"]["paragraph"]["f1"], 1.0)
+        self.assertEqual(matches[0]["match_basis"], ["text_token_jaccard"])
+        self.assertEqual(matches[1]["match_basis"], ["bbox_iou"])
+        self.assertEqual(scores["matching"]["matched_blocks"], 2)
+
+    def test_structure_scores_do_not_use_unlabeled_or_incompatible_geometry(self) -> None:
+        reference = {
+            "type": "paragraph",
+            "text": "reference-only alpha",
+            "bbox": [0, 0, 100, 20],
+            "geometry": {
+                "coordinate_space": "pdf_points",
+                "coordinate_frame": "pdf_page_points_top_left_unrotated",
+                "page_bbox": [0, 0, 300, 100],
+            },
+        }
+        ocr = {
+            "label": "Text",
+            "text": "unrelated OCR beta",
+            "bbox": [0, 0, 100, 20],
+            "geometry": {
+                "coordinate_space": "raster_pixels",
+                "coordinate_frame": "surya_raster",
+                "page_bbox": [0, 0, 300, 100],
+            },
+        }
+
+        compatible, status = geometry_compatibility(reference, ocr)
+        scores = structure_scores([reference], [ocr])
+
+        self.assertFalse(compatible)
+        self.assertEqual(status, "non_normalized_coordinate_space")
+        self.assertEqual(scores["per_type"]["paragraph"]["f1"], 0.0)
+
+    def test_structure_matching_maximizes_cardinality_before_evidence(self) -> None:
+        # R0 has a perfect match with O0, but then R1 has no remaining match.
+        # A maximum-cardinality matcher must instead use R0->O1 and R1->O0.
+        reference_blocks = [
+            {"type": "paragraph", "text": "a b c d e f g h i j"},
+            {"type": "paragraph", "text": "a b c"},
+        ]
+        ocr_blocks = [
+            {"label": "Text", "text": "a b c d e f g h i j"},
+            {"label": "Text", "text": "d e f g h i j"},
+        ]
+
+        scores = structure_scores(reference_blocks, ocr_blocks)
+        matches = scores["matching"]["matches"]
+
+        self.assertEqual(scores["per_type"]["paragraph"]["matched"], 2)
+        self.assertEqual(scores["per_type"]["paragraph"]["f1"], 1.0)
+        self.assertEqual(
+            {(match["reference_block_index"], match["ocr_block_index"]) for match in matches},
+            {(0, 1), (1, 0)},
+        )
+
+    def test_reading_order_marks_low_match_coverage_inconclusive(self) -> None:
+        reference_blocks = [
+            {
+                "type": "paragraph",
+                "text": text,
+                "bbox": [0, index * 20, 100, index * 20 + 10],
+            }
+            for index, text in enumerate(("alpha", "bravo", "charlie", "delta", "echo"))
+        ]
+        ocr_blocks = [
+            {
+                "label": "Text",
+                "text": text,
+                "bbox": [0, index * 20, 100, index * 20 + 10],
+            }
+            for index, text in enumerate(("alpha", "bravo"))
+        ]
+
+        details = order_similarity_details(reference_blocks, ocr_blocks)
+        legacy_rate, legacy_matched, legacy_inversions = order_similarity(
+            reference_blocks,
+            ocr_blocks,
+        )
+
+        self.assertEqual(details["status"], "inconclusive")
+        self.assertIn("low_reference_match_coverage", details["inconclusive_reasons"])
+        self.assertEqual(details["reference_match_coverage"], 0.4)
+        self.assertEqual(details["ocr_match_coverage"], 1.0)
+        self.assertIsNone(details["inversion_rate"])
+        self.assertEqual(details["observed_inversion_rate"], 0.0)
+        # Existing callers can still use the historical tuple for diagnostics.
+        self.assertEqual((legacy_rate, legacy_matched, legacy_inversions), (0.0, 2, 0))
+
+    def test_reading_order_uses_declared_order_not_input_array_order(self) -> None:
+        # The reference array is intentionally reversed. Explicit orders are
+        # the source of truth, so this is still a correctly ordered OCR page.
+        reference_blocks = [
+            {"type": "paragraph", "text": "second", "reading_order": 2},
+            {"type": "paragraph", "text": "first", "reading_order": 1},
+        ]
+        ocr_blocks = [
+            {"label": "Text", "text": "first", "reading_order": 1},
+            {"label": "Text", "text": "second", "reading_order": 2},
+        ]
+
+        details = order_similarity_details(reference_blocks, ocr_blocks)
+
+        self.assertEqual(details["status"], "measured")
+        self.assertEqual(details["inversions"], 0)
+        self.assertEqual(details["inversion_rate"], 0.0)
+        self.assertEqual(
+            [match["reference_reading_order"] for match in details["matches"]],
+            [1.0, 2.0],
+        )
+
     def test_rich_cascade_uses_authoritative_blocks_and_semantic_block_types(self) -> None:
         rich_page = {
             "page": 1,
@@ -697,7 +888,7 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
                 {"authoritative": {"text": "Selected fallback", "blocks": []}, "layers": {"pymupdf": {"text": "wrong"}}},
                 "cascade",
             ),
-            [{"text": "Selected fallback", "label": None, "bbox": None, "reading_order": 1}],
+            [{"text": "Selected fallback", "label": None, "bbox": None, "reading_order": 1, "geometry": None}],
         )
 
     def test_evaluator_joins_by_page_id_and_rejects_mismatches(self) -> None:
@@ -801,6 +992,12 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
                 "by_type": {"picture": 1},
             })
             self.assertEqual(evaluation["structure"][0]["per_type"]["table"]["f1"], 1.0)
+            self.assertEqual(evaluation["structure"][0]["matching"]["matched_blocks"], 4)
+            self.assertEqual(evaluation["reading_order"]["per_page"][0]["status"], "measured")
+            self.assertEqual(
+                evaluation["reading_order"]["per_page"][0]["reference_match_coverage"],
+                1.0,
+            )
 
     def test_rich_cascade_missing_authoritative_output_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

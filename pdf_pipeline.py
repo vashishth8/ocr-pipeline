@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from difflib import SequenceMatcher
 import hashlib
 import html
 import json
@@ -28,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -40,11 +42,12 @@ except ImportError as exc:
     raise SystemExit("PyMuPDF is required: ./sttl/bin/python -m pip install PyMuPDF") from exc
 
 
-PIPELINE_VERSION = "1.4"
+PIPELINE_VERSION = "1.6"
 RICH_SCHEMA_VERSION = "cascade-ocr/rich-v1"
 COMPLETE = "complete"
 PAGE_STATES = ("DIGITAL", "SCANNED", "MIXED", "OCR_NEEDED")
 VISUAL_BLOCK_TYPES = frozenset({"chart", "diagram", "figure", "image", "picture"})
+PDF_POINT_FRAME = "pdf_page_points_top_left_unrotated"
 
 # These geometry thresholds are intentionally expressed as page-relative
 # values.  Tesseract receives a rendered image, so absolute pixels would make
@@ -62,6 +65,22 @@ STRUCTURE_MAX_COLUMN_WIDTH_RATIO = 0.60
 STRUCTURE_MIN_COLUMN_HEIGHT_RATIO = 0.25
 STRUCTURE_MIN_COLUMN_VERTICAL_OVERLAP = 0.40
 
+# Hybrid text is intentionally conservative. It is only useful if it leaves
+# each textual region with one unambiguous owner and two engines substantially
+# agree about its content.
+HYBRID_MIN_TOKEN_F1 = 1.0
+HYBRID_MIN_SEQUENCE_RATIO = 1.0
+# Table cells are order-sensitive. Tesseract's global order may be
+# column-major, so a table hybrid is allowed only after spatial row ordering
+# produces the exact token sequence Surya identified.
+HYBRID_TABLE_SEQUENCE_RATIO = 1.0
+HYBRID_MAX_REGION_OVERLAP_RATIO = 0.15
+HYBRID_MAX_UNASSIGNED_WORD_RATIO = 0.0
+CRITICAL_VALUE_RE = re.compile(
+    r"(?:\(\s*(?:[$€£₹]\s*)?[+\-−]?\d[\d,._:/\-]*\s*%?\s*\)|(?:[$€£₹]\s*)?[+\-−]?\d[\d,._:/\-]*\s*%?)",
+    re.UNICODE,
+)
+
 
 @dataclass(frozen=True)
 class PipelineConfig:
@@ -77,6 +96,11 @@ class PipelineConfig:
     # Opt in because a structurally complex page costs a full Surya pass even
     # when its plain Tesseract text is high-confidence.
     structure_aware: bool = False
+    # A structure escalation already has a quality-accepted Tesseract pass.
+    # Retain Surya's semantic regions while preferring high-confidence
+    # Tesseract words inside those regions. This never applies to a quality
+    # rejection, where Surya remains the text authority.
+    structure_hybrid_text: bool = True
     min_native_chars: int = 80
     min_native_words: int = 12
     max_native_garbage_ratio: float = 0.05
@@ -353,6 +377,7 @@ def render_page(page: fitz.Page, path: Path, dpi: int) -> dict[str, Any]:
         return {
             "source_coordinate_space": "raster_pixels",
             "coordinate_space": "pdf_points",
+            "coordinate_frame": PDF_POINT_FRAME,
             "pdf_coordinate_convention": "pymupdf_unrotated_page_points",
             "dpi": dpi,
             "raster_width": pixmap.width,
@@ -478,6 +503,7 @@ def scale_ocr_items_to_pdf_points(items: Sequence[dict[str, Any]], raster: dict[
             output["source_polygon"] = [list(point[:2]) for point in polygon]
             output["polygon"] = mapped_polygon
         output["coordinate_space"] = "pdf_points"
+        output["coordinate_frame"] = PDF_POINT_FRAME
         scaled.append(output)
     return scaled
 
@@ -567,7 +593,10 @@ def canonical_blocks(raw_blocks: Sequence[dict[str, Any]]) -> list[dict[str, Any
         # Keep documented engine evidence rather than flattening it away.  We
         # deliberately whitelist fields so the normalized artifact remains
         # stable even when an engine adds unrelated response fields.
-        for key in ("raw_label", "html", "source", "coordinate_space", "skipped", "error", "retain_empty"):
+        for key in (
+            "raw_label", "html", "source", "coordinate_space", "coordinate_frame", "skipped", "error", "retain_empty",
+            "layout_engine", "text_engine", "text_provenance", "surya_structure",
+        ):
             if key in raw:
                 block[key] = raw[key]
         confidence = raw.get("confidence")
@@ -1094,6 +1123,438 @@ def extract_surya_layout(prediction: Any) -> tuple[str, list[dict[str, Any]]]:
     return "\n".join(block["text"] for block in blocks if block.get("text")).strip(), blocks
 
 
+def _bbox_area(bbox: Any) -> float:
+    value = _float_bbox(bbox)
+    if value is None:
+        return 0.0
+    return max(0.0, value[2] - value[0]) * max(0.0, value[3] - value[1])
+
+
+def _bbox_intersection_area(left: Any, right: Any) -> float:
+    first = _float_bbox(left)
+    second = _float_bbox(right)
+    if first is None or second is None:
+        return 0.0
+    return max(0.0, min(first[2], second[2]) - max(first[0], second[0])) * max(
+        0.0,
+        min(first[3], second[3]) - max(first[1], second[1]),
+    )
+
+
+def _word_region_overlap_score(word_bbox: Any, region_bbox: Any) -> float | None:
+    """Score a Tesseract word's membership in one Surya region.
+
+    Small coordinate drift is normal between two OCR engines. A word is
+    therefore accepted when its center falls in the region or when at least
+    half of its area overlaps it. The score prefers center containment, then
+    overlap coverage. Hybridization rejects pages with overlapping text
+    regions before invoking this function, so an accepted word has one clear
+    authoritative owner.
+    """
+    word = _float_bbox(word_bbox)
+    region = _float_bbox(region_bbox)
+    if word is None or region is None:
+        return None
+    intersection_width = max(0.0, min(word[2], region[2]) - max(word[0], region[0]))
+    intersection_height = max(0.0, min(word[3], region[3]) - max(word[1], region[1]))
+    intersection = intersection_width * intersection_height
+    word_area = _bbox_area(word)
+    if intersection <= 0.0 or word_area <= 0.0:
+        return None
+    coverage = intersection / word_area
+    center_x = (word[0] + word[2]) / 2.0
+    center_y = (word[1] + word[3]) / 2.0
+    center_inside = region[0] <= center_x <= region[2] and region[1] <= center_y <= region[3]
+    if not center_inside and coverage < 0.5:
+        return None
+    return (2.0 if center_inside else 0.0) + coverage
+
+
+def _surya_text_region(block: dict[str, Any]) -> bool:
+    """Whether a Surya region is safe to receive OCR text from Tesseract."""
+    if block.get("skipped") or block.get("error"):
+        return False
+    if not str(block.get("text", "")).strip():
+        return False
+    label = str(block.get("block_type") or block.get("type") or "").strip().lower()
+    return label not in VISUAL_BLOCK_TYPES
+
+
+def _is_table_region(block: dict[str, Any]) -> bool:
+    """Recognize the canonical and raw spellings of Surya table blocks."""
+    label = str(block.get("block_type") or block.get("type") or "")
+    return re.sub(r"[\W_]+", "", label.casefold()) == "table"
+
+
+def _reading_ordered_words(
+    assigned: Sequence[tuple[int, dict[str, Any]]],
+) -> list[tuple[int, dict[str, Any]]]:
+    return sorted(
+        assigned,
+        key=lambda item: (
+            0 if isinstance(item[1].get("reading_order"), (int, float)) else 1,
+            float(item[1].get("reading_order", 0)) if isinstance(item[1].get("reading_order"), (int, float)) else 0.0,
+            item[0],
+        ),
+    )
+
+
+def _spatial_row_ordered_table_words(
+    assigned: Sequence[tuple[int, dict[str, Any]]],
+) -> list[tuple[int, dict[str, Any]]]:
+    """Recover row-major table order from word geometry when it is available.
+
+    Tesseract can enumerate a multi-column table column-by-column even when
+    its word boxes clearly encode rows. Group nearby vertical centers into
+    visual rows and read each row left-to-right. The hybrid still requires an
+    exact Surya token sequence afterward, so uncertain row grouping declines
+    safely rather than changing the table's authoritative order.
+    """
+    fallback = _reading_ordered_words(assigned)
+    positioned: list[tuple[int, dict[str, Any], list[float], float]] = []
+    for index, word in fallback:
+        bbox = _float_bbox(word.get("bbox"))
+        if bbox is None:
+            return fallback
+        positioned.append((index, word, bbox, (bbox[1] + bbox[3]) / 2.0))
+    if not positioned:
+        return fallback
+
+    typical_height = median(max(1.0, bbox[3] - bbox[1]) for _, _, bbox, _ in positioned)
+    line_tolerance = max(1.0, typical_height * 0.75)
+    rows: list[dict[str, Any]] = []
+    for item in sorted(positioned, key=lambda value: (value[3], value[2][0], value[0])):
+        if not rows or item[3] - rows[-1]["center_y"] > line_tolerance:
+            rows.append({"center_y": item[3], "items": [item]})
+            continue
+        row = rows[-1]
+        row["items"].append(item)
+        row["center_y"] = sum(value[3] for value in row["items"]) / len(row["items"])
+
+    return [
+        (index, word)
+        for row in rows
+        for index, word, _bbox, _center_y in sorted(
+            row["items"],
+            key=lambda value: (value[2][0], value[2][1], value[0]),
+        )
+    ]
+
+
+def _ordered_words_for_surya_region(
+    block: dict[str, Any],
+    assigned: Sequence[tuple[int, dict[str, Any]]],
+) -> tuple[list[tuple[int, dict[str, Any]]], str]:
+    if _is_table_region(block):
+        return _spatial_row_ordered_table_words(assigned), "spatial_row_major"
+    return _reading_ordered_words(assigned), "tesseract_reading_order"
+
+
+def _overlapping_surya_text_regions(
+    blocks: Sequence[dict[str, Any]],
+    eligible: Sequence[int],
+) -> list[dict[str, Any]]:
+    """Return meaningful textual-region overlaps that make ownership unsafe."""
+    overlaps: list[dict[str, Any]] = []
+    for position, left_index in enumerate(eligible):
+        left = blocks[left_index]
+        left_area = _bbox_area(left.get("bbox"))
+        if not left_area:
+            continue
+        for right_index in eligible[position + 1 :]:
+            right = blocks[right_index]
+            right_area = _bbox_area(blocks[right_index].get("bbox"))
+            if not right_area:
+                continue
+            intersection = _bbox_intersection_area(left.get("bbox"), blocks[right_index].get("bbox"))
+            overlap_ratio = intersection / min(left_area, right_area) if intersection else 0.0
+            if overlap_ratio >= HYBRID_MAX_REGION_OVERLAP_RATIO:
+                overlaps.append({
+                    "first_reading_order": left.get("reading_order"),
+                    "second_reading_order": blocks[right_index].get("reading_order"),
+                    "overlap_ratio_of_smaller_region": round(overlap_ratio, 6),
+                })
+    return overlaps
+
+
+def _text_tokens_for_agreement(text: str) -> list[str]:
+    return [token for token in re.findall(r"\w+", normalize_whitespace(text).casefold(), flags=re.UNICODE) if token]
+
+
+def _critical_value_tokens(text: str) -> list[str]:
+    """Keep sign-, currency-, decimal-, and percentage-bearing values intact."""
+    return [
+        re.sub(r"\s+", "", token).replace("−", "-").casefold()
+        for token in CRITICAL_VALUE_RE.findall(normalize_whitespace(text))
+    ]
+
+
+def text_agreement(left: str, right: str) -> dict[str, float | int | bool]:
+    """Report token-content and token-sequence agreement transparently.
+
+    Bag agreement alone cannot distinguish a row-major table from a
+    column-major transcription of the same cells.  The sequence metric is a
+    token-level ``SequenceMatcher`` ratio, recorded alongside the less strict
+    bag metrics so a hybrid decision can be audited without calling it CER.
+    """
+    left_tokens = _text_tokens_for_agreement(left)
+    right_tokens = _text_tokens_for_agreement(right)
+    left_critical_values = _critical_value_tokens(left)
+    right_critical_values = _critical_value_tokens(right)
+    left_counts = Counter(left_tokens)
+    right_counts = Counter(right_tokens)
+    shared = sum((left_counts & right_counts).values())
+    union = sum((left_counts | right_counts).values())
+    precision = shared / len(right_tokens) if right_tokens else 0.0
+    recall = shared / len(left_tokens) if left_tokens else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    sequence_matches = sum(
+        block.size
+        for block in SequenceMatcher(
+            a=left_tokens,
+            b=right_tokens,
+            autojunk=False,
+        ).get_matching_blocks()
+    )
+    sequence_ratio = (
+        2 * sequence_matches / (len(left_tokens) + len(right_tokens))
+        if left_tokens or right_tokens
+        else 0.0
+    )
+    return {
+        "surya_tokens": len(left_tokens),
+        "tesseract_tokens": len(right_tokens),
+        "shared_tokens": shared,
+        "token_precision": round(precision, 6),
+        "token_recall": round(recall, 6),
+        "token_f1": round(f1, 6),
+        "token_jaccard": round(shared / union, 6) if union else 0.0,
+        "sequence_matches": sequence_matches,
+        "sequence_ratio": round(sequence_ratio, 6),
+        # Tokenization above intentionally ignores ordinary punctuation for
+        # OCR tolerance, but never allow it to erase a financial sign,
+        # decimal, date separator, currency marker, or percentage.
+        "surya_critical_value_tokens": len(left_critical_values),
+        "tesseract_critical_value_tokens": len(right_critical_values),
+        "critical_value_tokens_match": left_critical_values == right_critical_values,
+    }
+
+
+def hybridize_surya_layout_with_tesseract(
+    surya_blocks: Sequence[dict[str, Any]],
+    tesseract_words: Sequence[dict[str, Any]],
+    *,
+    confident_word_threshold: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Use Tesseract text only when the complete Surya text layout is safe.
+
+    A partial region replacement creates ambiguous ownership: unassigned Surya
+    text can be duplicated or silently lost, especially with nested layout
+    blocks. This function therefore applies a hybrid only when every
+    text-bearing, non-visual Surya region has high-confidence overlapping
+    Tesseract words with the same canonical token sequence, and no competing
+    or unassigned text. Otherwise the caller receives unchanged Surya output.
+    """
+    source_blocks = [dict(block) for block in surya_blocks if isinstance(block, dict)]
+    eligible = [index for index, block in enumerate(source_blocks) if _surya_text_region(block)]
+    base_details: dict[str, Any] = {
+        "applied": False,
+        "strategy": "all_or_nothing_exact_tesseract_token_sequence_in_surya_regions",
+        "layout_engine": "surya",
+        "text_engine": "tesseract5",
+        "confident_word_threshold": confident_word_threshold,
+        "minimum_token_f1": HYBRID_MIN_TOKEN_F1,
+        "minimum_sequence_ratio": HYBRID_MIN_SEQUENCE_RATIO,
+        "table_sequence_requirement": "exact_token_sequence_after_spatial_row_ordering",
+        "all_high_confidence_tesseract_words_must_be_assigned": True,
+        "maximum_region_overlap_ratio": HYBRID_MAX_REGION_OVERLAP_RATIO,
+            "maximum_unassigned_word_ratio": HYBRID_MAX_UNASSIGNED_WORD_RATIO,
+        "eligible_surya_text_regions": len(eligible),
+    }
+    non_hybrid_text_regions = [
+        {
+            "reading_order": block.get("reading_order"),
+            "block_type": block.get("block_type"),
+        }
+        for block in source_blocks
+        if str(block.get("text", "")).strip() and not _surya_text_region(block)
+    ]
+    # A visual description or failed region with text would remain Surya-owned
+    # in final page text. Do not claim a wholly Tesseract text page in that
+    # mixed case; retain the unmodified Surya result instead.
+    if non_hybrid_text_regions:
+        return canonical_blocks(source_blocks), {
+            **base_details,
+            "skip_reason": "non_tesseract_textual_surya_regions",
+            "non_hybrid_text_regions": non_hybrid_text_regions,
+            "hybridized_regions": 0,
+            "selected_tesseract_words": 0,
+        }
+    if not eligible:
+        return canonical_blocks(source_blocks), {
+            **base_details,
+            "skip_reason": "no_textual_surya_regions",
+            "hybridized_regions": 0,
+            "selected_tesseract_words": 0,
+        }
+
+    overlapping_regions = _overlapping_surya_text_regions(source_blocks, eligible)
+    if overlapping_regions:
+        return canonical_blocks(source_blocks), {
+            **base_details,
+            "skip_reason": "overlapping_surya_text_regions",
+            "overlapping_surya_text_regions": overlapping_regions,
+            "hybridized_regions": 0,
+            "selected_tesseract_words": 0,
+        }
+
+    assignments: dict[int, list[tuple[int, dict[str, Any]]]] = {index: [] for index in eligible}
+    high_confidence_words = 0
+    no_geometry_words = 0
+    low_confidence_words = 0
+    unassigned_high_confidence_words = 0
+
+    for word_index, word in enumerate(tesseract_words):
+        if not isinstance(word, dict) or not str(word.get("text", "")).strip():
+            continue
+        confidence = word.get("confidence")
+        if not isinstance(confidence, (int, float)) or float(confidence) < confident_word_threshold:
+            low_confidence_words += 1
+            continue
+        high_confidence_words += 1
+        if _float_bbox(word.get("bbox")) is None:
+            no_geometry_words += 1
+            unassigned_high_confidence_words += 1
+            continue
+        choices: list[tuple[float, int]] = []
+        for block_index in eligible:
+            score = _word_region_overlap_score(word.get("bbox"), source_blocks[block_index].get("bbox"))
+            if score is not None:
+                choices.append((score, block_index))
+        if not choices:
+            unassigned_high_confidence_words += 1
+            continue
+        _, selected = max(choices, key=lambda item: (item[0], -item[1]))
+        assignments[selected].append((word_index, word))
+
+    region_texts: dict[int, dict[str, Any]] = {}
+    rejected_regions: list[dict[str, Any]] = []
+    for block_index, assigned in assignments.items():
+        block = source_blocks[block_index]
+        ordered_assigned, tesseract_ordering = _ordered_words_for_surya_region(block, assigned)
+        selected_text = normalize_whitespace(" ".join(str(word.get("text", "")).strip() for _, word in ordered_assigned))
+        surya_text = str(block.get("text", "")).strip()
+        agreement = text_agreement(surya_text, selected_text)
+        required_sequence_ratio = (
+            HYBRID_TABLE_SEQUENCE_RATIO
+            if _is_table_region(block)
+            else HYBRID_MIN_SEQUENCE_RATIO
+        )
+        if (
+            not selected_text
+            or agreement["token_f1"] < HYBRID_MIN_TOKEN_F1
+            or agreement["sequence_ratio"] < required_sequence_ratio
+            or not agreement["critical_value_tokens_match"]
+        ):
+            reasons = []
+            if not selected_text:
+                reasons.append("no_high_confidence_tesseract_text")
+            if agreement["token_f1"] < HYBRID_MIN_TOKEN_F1:
+                reasons.append("low_token_f1")
+            if agreement["sequence_ratio"] < required_sequence_ratio:
+                reasons.append("low_token_sequence_ratio")
+            if not agreement["critical_value_tokens_match"]:
+                reasons.append("critical_value_token_mismatch")
+            rejected_regions.append({
+                "reading_order": block.get("reading_order"),
+                "tesseract_word_count": len(assigned),
+                "token_f1": agreement["token_f1"],
+                "sequence_ratio": agreement["sequence_ratio"],
+                "required_sequence_ratio": required_sequence_ratio,
+                "critical_value_tokens_match": agreement["critical_value_tokens_match"],
+                "rejection_reasons": reasons,
+            })
+            continue
+        region_texts[block_index] = {
+            "text": selected_text,
+            "surya_text": surya_text,
+            "agreement": agreement,
+            "required_sequence_ratio": required_sequence_ratio,
+            "tesseract_ordering": tesseract_ordering,
+            "reading_orders": [
+                word.get("reading_order")
+                for _, word in ordered_assigned
+                if word.get("reading_order") is not None
+            ],
+            "word_count": len(assigned),
+        }
+
+    unassigned_ratio = (
+        unassigned_high_confidence_words / high_confidence_words
+        if high_confidence_words
+        else 1.0
+    )
+    if rejected_regions or unassigned_ratio > HYBRID_MAX_UNASSIGNED_WORD_RATIO:
+        skip_reason = "insufficient_per_region_agreement" if rejected_regions else "too_many_unassigned_tesseract_words"
+        return canonical_blocks(source_blocks), {
+            **base_details,
+            "skip_reason": skip_reason,
+            "hybridized_regions": 0,
+            "selected_tesseract_words": 0,
+            "high_confidence_tesseract_words": high_confidence_words,
+            "low_confidence_tesseract_words": low_confidence_words,
+            "tesseract_words_without_geometry": no_geometry_words,
+            "unassigned_high_confidence_tesseract_words": unassigned_high_confidence_words,
+            "unassigned_high_confidence_tesseract_word_ratio": round(unassigned_ratio, 6),
+            "rejected_regions": rejected_regions,
+        }
+
+    # Each textual Surya region is now covered, so page-level engine ownership
+    # is honest: all final text originates from Tesseract while Surya supplies
+    # semantic type and geometry. Move raw table/HTML text out of authoritative
+    # fields to prevent a consumer from reading two contradictory values.
+    selected_words = 0
+    for block_index, region in region_texts.items():
+        block = source_blocks[block_index]
+        surya_structure = {
+            key: block.pop(key)
+            for key in ("html", "table")
+            if key in block
+        }
+        if surya_structure:
+            block["surya_structure"] = surya_structure
+        block["text"] = region["text"]
+        block["layout_engine"] = "surya"
+        block["text_engine"] = "tesseract5"
+        block["text_provenance"] = {
+            "strategy": base_details["strategy"],
+            "layout_engine": "surya",
+            "text_engine": "tesseract5",
+            "surya_text": region["surya_text"],
+            "tesseract_confidence_threshold": confident_word_threshold,
+            "tesseract_word_count": region["word_count"],
+            "tesseract_word_reading_orders": region["reading_orders"],
+            "minimum_token_f1": HYBRID_MIN_TOKEN_F1,
+            "minimum_sequence_ratio": region["required_sequence_ratio"],
+            "tesseract_word_ordering": region["tesseract_ordering"],
+            "agreement": region["agreement"],
+        }
+        selected_words += region["word_count"]
+
+    return canonical_blocks(source_blocks), {
+        **base_details,
+        "applied": True,
+        "hybridized_regions": len(region_texts),
+        "selected_tesseract_words": selected_words,
+        "high_confidence_tesseract_words": high_confidence_words,
+        "low_confidence_tesseract_words": low_confidence_words,
+        "tesseract_words_without_geometry": no_geometry_words,
+        "unassigned_high_confidence_tesseract_words": unassigned_high_confidence_words,
+        "unassigned_high_confidence_tesseract_word_ratio": round(unassigned_ratio, 6),
+        "all_eligible_surya_regions_hybridized": len(region_texts) == len(eligible),
+    }
+
+
 def atomic_write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -1270,6 +1731,8 @@ def make_record(
     blocks: list[dict[str, Any]] | None = None,
     raster: dict[str, Any] | None = None,
     tesseract_candidate: dict[str, Any] | None = None,
+    surya_candidate: dict[str, Any] | None = None,
+    hybrid_text: dict[str, Any] | None = None,
     escalation_reason: str | None = None,
     structure_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1304,6 +1767,10 @@ def make_record(
     # their already-authoritative words and blocks in the JSONL manifest.
     if tesseract_candidate is not None:
         record["tesseract_candidate"] = tesseract_candidate
+    if surya_candidate is not None:
+        record["surya_candidate"] = surya_candidate
+    if hybrid_text is not None:
+        record["hybrid_text"] = hybrid_text
     return record
 
 
@@ -1318,7 +1785,7 @@ def summarise_document(
     states = {state: 0 for state in PAGE_STATES}
     outcomes: dict[str, int] = {}
     confidences: list[float] = []
-    quality_escalations = structure_escalations = 0
+    quality_escalations = structure_escalations = hybrid_text_pages = 0
     for record in records.values():
         if record.get("classification") in states:
             states[record["classification"]] += 1
@@ -1335,6 +1802,8 @@ def summarise_document(
                 structure_escalations += 1
             else:
                 quality_escalations += 1
+        if isinstance(record.get("hybrid_text"), dict) and record["hybrid_text"].get("applied"):
+            hybrid_text_pages += 1
     return {
         "pipeline_version": PIPELINE_VERSION,
         "source": source["file_name"],
@@ -1350,6 +1819,7 @@ def summarise_document(
         "surya_escalated_pages": outcomes.get("surya_escalated", 0),
         "surya_quality_escalated_pages": quality_escalations,
         "surya_structure_escalated_pages": structure_escalations,
+        "surya_hybrid_text_pages": hybrid_text_pages,
         "mean_tesseract_confidence": round(fmean(confidences), 3) if confidences else None,
         "updated_at_epoch": time.time(),
     }
@@ -1526,6 +1996,7 @@ def native_page_layer(page: fitz.Page) -> dict[str, Any]:
     return {
         "available": True,
         "coordinate_space": "pdf_points",
+        "coordinate_frame": PDF_POINT_FRAME,
         "text": page.get_text("text", sort=True).strip(),
         "blocks": native_rich_blocks(page),
         "images": native_images(page),
@@ -1573,17 +2044,23 @@ def normalized_page(record: dict[str, Any], page: fitz.Page) -> dict[str, Any]:
             {"block_type": "Text", "type": "text", "text": record.get("text", ""), "reading_order": 1}
         ])
     blocks = canonical_blocks(blocks)
+    hybrid = record.get("hybrid_text")
+    hybrid_applied = isinstance(hybrid, dict) and bool(hybrid.get("applied"))
+    text_engine = "tesseract5" if hybrid_applied else record.get("engine")
     entry: dict[str, Any] = {
         "page": record["page"],
         "text": record.get("text", ""),
         "bbox": page_bbox(page),
         "coordinate_space": "pdf_points",
+        "coordinate_frame": PDF_POINT_FRAME,
         "block_type": "Page",
         "reading_order": record["page"],
         "blocks": blocks,
         "reading_order_check": reading_order_check(blocks),
         "metadata": {
             "engine": record.get("engine"),
+            "layout_engine": "surya" if hybrid_applied else record.get("engine"),
+            "text_engine": text_engine,
             "classification": record.get("classification"),
             "route": record.get("route"),
             "outcome": record.get("outcome"),
@@ -1600,6 +2077,8 @@ def normalized_page(record: dict[str, Any], page: fitz.Page) -> dict[str, Any]:
         entry["metadata"]["structure_gate"] = record["structure_gate"]
     if isinstance(record.get("escalation_reason"), str):
         entry["metadata"]["escalation_reason"] = record["escalation_reason"]
+    if isinstance(record.get("hybrid_text"), dict):
+        entry["metadata"]["hybrid_text"] = record["hybrid_text"]
     return entry
 
 
@@ -1646,6 +2125,7 @@ def write_normalized_json(
                 "outcome_counts": summary["outcome_counts"],
                 "surya_quality_escalated_pages": summary["surya_quality_escalated_pages"],
                 "surya_structure_escalated_pages": summary["surya_structure_escalated_pages"],
+                "surya_hybrid_text_pages": summary["surya_hybrid_text_pages"],
             },
             "tesseract_quality_gate": {
                 "min_mean_confidence": config.min_mean_confidence,
@@ -1656,7 +2136,10 @@ def write_normalized_json(
                 "min_characters": config.min_tesseract_chars,
                 "min_words": config.min_tesseract_words,
             },
-            "structure_gate": {"enabled": config.structure_aware},
+            "structure_gate": {
+                "enabled": config.structure_aware,
+                "hybrid_text_enabled": config.structure_aware and config.structure_hybrid_text,
+            },
             "reading_order": order_report,
         },
     }
@@ -1666,21 +2149,33 @@ def write_normalized_json(
 
 
 def tesseract_layer(record: dict[str, Any]) -> dict[str, Any]:
-    """Expose Tesseract evidence even when Surya became authoritative."""
+    """Expose raw Tesseract evidence without mislabeling it as final text."""
     candidate = record.get("tesseract_candidate")
     if isinstance(candidate, dict):
+        hybrid = record.get("hybrid_text")
+        hybrid_applied = isinstance(hybrid, dict) and bool(hybrid.get("applied"))
         return {
             "attempted": True,
+            # The raw candidate can differ from the reconstructed hybrid text
+            # after region assignment / table row ordering. Only the top-level
+            # authoritative layer is selected in that case.
             "selected": False,
+            "selected_layout": False,
+            "selected_text": False,
+            "contributes_to_authoritative_layout": False,
+            "contributes_to_authoritative_text": hybrid_applied,
             "text": candidate.get("text", ""),
             "quality": candidate.get("quality"),
             "words": candidate.get("words", []),
             "blocks": candidate.get("blocks", []),
+            "hybrid_text": hybrid,
         }
     if record.get("engine") == "tesseract5":
         return {
             "attempted": True,
             "selected": True,
+            "selected_layout": True,
+            "selected_text": True,
             "text": record.get("text", ""),
             "quality": record.get("tesseract_quality"),
             "words": record.get("words", []),
@@ -1692,21 +2187,40 @@ def tesseract_layer(record: dict[str, Any]) -> dict[str, Any]:
 def surya_layer(record: dict[str, Any]) -> dict[str, Any]:
     """Expose Surya's semantic blocks, including its original HTML tables."""
     selected = record.get("engine") == "surya"
+    candidate = record.get("surya_candidate")
+    hybrid = record.get("hybrid_text")
+    if isinstance(candidate, dict):
+        return {
+            "attempted": True,
+            # This is the raw Surya candidate. The selected layout is the
+            # top-level authoritative hybrid, which may omit raw HTML fields
+            # to avoid conflicting text values.
+            "selected": False,
+            "selected_layout": False,
+            "selected_text": False,
+            "contributes_to_authoritative_layout": True,
+            "contributes_to_authoritative_text": False,
+            "text": candidate.get("text", ""),
+            "blocks": candidate.get("blocks", []),
+            "hybrid_text": hybrid,
+        }
     return {
         "attempted": selected,
         "selected": selected,
+        "selected_layout": selected,
+        "selected_text": selected,
         "text": record.get("text", "") if selected else "",
         "blocks": record.get("blocks", []) if selected else [],
+        "hybrid_text": hybrid if isinstance(hybrid, dict) else None,
     }
 
 
 def rich_page(record: dict[str, Any], page: fitz.Page) -> dict[str, Any]:
-    """Build a multi-engine page without pretending that evidence was fused.
+    """Build a multi-engine page with one selected authoritative result.
 
-    One engine remains authoritative for final text and ordered blocks.  The
-    other layers are retained separately with provenance, letting a consumer
-    compare, repair, or selectively merge them without losing where a value
-    originated.
+    A validated hybrid can combine Surya layout with region-assigned Tesseract
+    text. Raw engine layers remain evidence rather than selected output, and
+    explicitly state which part of the authoritative result they contributed.
     """
     authoritative = normalized_page(record, page)
     routing: dict[str, Any] = {
@@ -1720,12 +2234,20 @@ def rich_page(record: dict[str, Any], page: fitz.Page) -> dict[str, Any]:
         routing["structure_gate"] = record["structure_gate"]
     if isinstance(record.get("escalation_reason"), str):
         routing["escalation_reason"] = record["escalation_reason"]
+    hybrid = record.get("hybrid_text")
+    if isinstance(hybrid, dict):
+        routing["hybrid_text"] = hybrid
+    hybrid_applied = isinstance(hybrid, dict) and bool(hybrid.get("applied"))
+    text_engine = "tesseract5" if hybrid_applied else record.get("engine")
     return {
         "page": record["page"],
         "bbox": page_bbox(page),
         "coordinate_space": "pdf_points",
+        "coordinate_frame": PDF_POINT_FRAME,
         "authoritative": {
             "engine": record.get("engine"),
+            "layout_engine": "surya" if hybrid_applied else record.get("engine"),
+            "text_engine": text_engine,
             "outcome": record.get("outcome"),
             "text": authoritative["text"],
             "blocks": authoritative["blocks"],
@@ -1757,24 +2279,29 @@ def write_rich_output(
         "source": pdf_path.name,
         "page_count": len(pages),
         "coordinate_space": "pdf_points",
+        "coordinate_frame": PDF_POINT_FRAME,
         "pages": pages,
         "metadata": {
             "pipeline_version": PIPELINE_VERSION,
             "pipeline": "PyMuPDF -> Tesseract 5 -> quality / optional structure gate -> Surya fallback",
-            "authoritative_selection": "one engine per page; non-winning evidence is retained in layers",
+            "authoritative_selection": "one engine per page, except accepted Tesseract text may populate Surya regions after a structure escalation; raw evidence is retained in layers",
             "ocr_coordinate_transform": "source_bbox/source_polygon are raster pixels; bbox/polygon are PDF points",
             "routing": {
                 "classification_counts": summary["classification_counts"],
                 "outcome_counts": summary["outcome_counts"],
                 "surya_quality_escalated_pages": summary["surya_quality_escalated_pages"],
                 "surya_structure_escalated_pages": summary["surya_structure_escalated_pages"],
+                "surya_hybrid_text_pages": summary["surya_hybrid_text_pages"],
             },
             "tesseract_quality_gate": {
                 "min_mean_confidence": config.min_mean_confidence,
                 "min_confident_word_ratio": config.min_confident_word_ratio,
                 "confident_word_threshold": config.confident_word_threshold,
             },
-            "structure_gate": {"enabled": config.structure_aware},
+            "structure_gate": {
+                "enabled": config.structure_aware,
+                "hybrid_text_enabled": config.structure_aware and config.structure_hybrid_text,
+            },
         },
     })
     return output_path
@@ -1804,13 +2331,52 @@ def flush_surya(
         ):
             raise RuntimeError(f"Surya returned a malformed result for page {candidate.page} ({candidate.image_path.name})")
         surya_blocks = scale_ocr_items_to_pdf_points(prediction["blocks"], candidate.raster)
+        raw_surya_text = str(prediction.get("text", "")).strip()
+        if not raw_surya_text:
+            raw_surya_text = "\n".join(
+                str(block.get("text", "")).strip()
+                for block in surya_blocks
+                if isinstance(block, dict) and str(block.get("text", "")).strip()
+            ).strip()
+        authoritative_blocks = surya_blocks
+        authoritative_text = raw_surya_text
+        hybrid_text: dict[str, Any] | None = None
+        surya_candidate: dict[str, Any] | None = None
+        # Structure escalation is only reached after the inexpensive OCR pass
+        # passed its text-quality gate.  It is consequently safe to let Surya
+        # provide semantic layout while high-confidence Tesseract words supply
+        # final text inside those regions. A quality rejection remains a pure
+        # Surya result because its Tesseract candidate is not trustworthy.
+        if (
+            config.structure_hybrid_text
+            and candidate.escalation_reason == "structure"
+            and bool(candidate.quality.get("accepted"))
+        ):
+            hybrid_blocks, details = hybridize_surya_layout_with_tesseract(
+                surya_blocks,
+                candidate.tesseract_words,
+                confident_word_threshold=config.confident_word_threshold,
+            )
+            # Persist declined attempts too: a structure route that remains
+            # pure Surya must be distinguishable from a page where hybridizing
+            # was disabled or never considered.
+            hybrid_text = details
+            if details["applied"]:
+                authoritative_blocks = hybrid_blocks
+                authoritative_text = "\n".join(
+                    str(block.get("text", "")).strip()
+                    for block in hybrid_blocks
+                    if str(block.get("text", "")).strip()
+                ).strip()
+                hybrid_text = details
+                surya_candidate = {"text": raw_surya_text, "blocks": surya_blocks}
         record_raster = dict(candidate.raster)
         source_image_bbox = prediction.get("source_image_bbox")
         if source_image_bbox is not None:
             record_raster["surya_source_image_bbox"] = source_image_bbox
         record = make_record(
-            candidate.page, candidate.inspection, engine="surya", outcome="surya_escalated", text=prediction.get("text", ""),
-            quality=candidate.quality, surya_batch_number=batch_number, blocks=surya_blocks, raster=record_raster,
+            candidate.page, candidate.inspection, engine="surya", outcome="surya_escalated", text=authoritative_text,
+            quality=candidate.quality, surya_batch_number=batch_number, blocks=authoritative_blocks, raster=record_raster,
             escalation_reason=candidate.escalation_reason, structure_gate=candidate.structure_gate,
             tesseract_candidate={
                 "text": candidate.tesseract_text,
@@ -1818,6 +2384,8 @@ def flush_surya(
                 "words": candidate.tesseract_words,
                 "blocks": candidate.tesseract_blocks,
             },
+            surya_candidate=surya_candidate,
+            hybrid_text=hybrid_text,
         )
         append_jsonl(manifest_path, record)
         records[candidate.page] = record
@@ -1963,14 +2531,14 @@ def write_batch_reports(output_root: Path) -> dict[str, Any]:
     aggregate = {
         "documents": 0, "complete_documents": 0, "incomplete_documents": 0,
         "source_pages": 0, "native_pages": 0, "tesseract_accepted_pages": 0, "surya_escalated_pages": 0,
-        "surya_quality_escalated_pages": 0, "surya_structure_escalated_pages": 0,
+        "surya_quality_escalated_pages": 0, "surya_structure_escalated_pages": 0, "surya_hybrid_text_pages": 0,
     }
     csv_path = output_root / "batch_summary.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = csv_path.with_name(f".{csv_path.name}.{os.getpid()}.tmp")
     fields = [
         "source", "state", "source_page_count", "native_pages", "tesseract_accepted_pages", "surya_escalated_pages",
-        "surya_quality_escalated_pages", "surya_structure_escalated_pages", "mean_tesseract_confidence",
+        "surya_quality_escalated_pages", "surya_structure_escalated_pages", "surya_hybrid_text_pages", "mean_tesseract_confidence",
     ]
     with temporary.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -1985,7 +2553,7 @@ def write_batch_reports(output_root: Path) -> dict[str, Any]:
             aggregate["source_pages"] += int(summary.get("source_page_count", 0))
             for field in (
                 "native_pages", "tesseract_accepted_pages", "surya_escalated_pages",
-                "surya_quality_escalated_pages", "surya_structure_escalated_pages",
+                "surya_quality_escalated_pages", "surya_structure_escalated_pages", "surya_hybrid_text_pages",
             ):
                 aggregate[field] += int(summary.get(field, 0))
             aggregate["complete_documents" if summary.get("state") == "complete" else "incomplete_documents"] += 1
@@ -1996,6 +2564,7 @@ def write_batch_reports(output_root: Path) -> dict[str, Any]:
                 "surya_escalated_pages": summary.get("surya_escalated_pages", 0),
                 "surya_quality_escalated_pages": summary.get("surya_quality_escalated_pages", 0),
                 "surya_structure_escalated_pages": summary.get("surya_structure_escalated_pages", 0),
+                "surya_hybrid_text_pages": summary.get("surya_hybrid_text_pages", 0),
                 "mean_tesseract_confidence": summary.get("mean_tesseract_confidence", ""),
             })
     os.replace(temporary, csv_path)
@@ -2030,6 +2599,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--structure-aware", action="store_true",
         help="Escalate Tesseract-accepted pages with table-like alignment or multiple text columns to Surya",
     )
+    parser.add_argument(
+        "--no-structure-hybrid-text", action="store_false", dest="structure_hybrid_text", default=True,
+        help="Keep Surya text on structure escalations instead of replacing region text with accepted Tesseract words",
+    )
     parser.add_argument("--min-native-chars", type=int, default=80)
     parser.add_argument("--min-native-words", type=int, default=12)
     parser.add_argument("--max-native-garbage-ratio", type=float, default=0.05)
@@ -2049,7 +2622,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         language=args.language, render_dpi=args.dpi, tesseract_psm=args.tesseract_psm,
         tesseract_timeout_seconds=args.tesseract_timeout, surya_timeout_seconds=args.surya_timeout,
         surya_batch_size=args.surya_batch_size, surya_keep_server=args.surya_keep_server,
-        structure_aware=args.structure_aware,
+        structure_aware=args.structure_aware, structure_hybrid_text=args.structure_hybrid_text,
         min_native_chars=args.min_native_chars,
         min_native_words=args.min_native_words, max_native_garbage_ratio=args.max_native_garbage_ratio,
         dominant_image_ratio=args.dominant_image_ratio, min_tesseract_chars=args.min_tesseract_chars,
