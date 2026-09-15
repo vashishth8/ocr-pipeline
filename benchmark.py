@@ -14,6 +14,16 @@ from pathlib import Path
 import psutil
 
 
+# psutil usually translates process-access failures to one of its own error
+# classes, but macOS sandboxing can surface a bare OSError from sysctl instead.
+# Treat either form as an unavailable sample, rather than letting monitoring
+# terminate the benchmarked command.
+PROCESS_ACCESS_ERRORS = (
+    psutil.Error,
+    OSError,
+)
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -21,20 +31,26 @@ def now():
 def get_tree(pid):
     try:
         root = psutil.Process(pid)
-    except psutil.NoSuchProcess:
+    except PROCESS_ACCESS_ERRORS:
         return []
 
     processes = [root]
 
     try:
         processes.extend(root.children(recursive=True))
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except PROCESS_ACCESS_ERRORS:
         pass
 
-    return [
-        p for p in processes
-        if p.is_running()
-    ]
+    running_processes = []
+
+    for process in processes:
+        try:
+            if process.is_running():
+                running_processes.append(process)
+        except PROCESS_ACCESS_ERRORS:
+            continue
+
+    return running_processes
 
 
 def get_cpu_time_and_memory(pid):
@@ -62,10 +78,7 @@ def get_cpu_time_and_memory(pid):
                 f"{p.pid}:{p.name()}"
             )
 
-        except (
-            psutil.NoSuchProcess,
-            psutil.AccessDenied
-        ):
+        except PROCESS_ACCESS_ERRORS:
             pass
 
     return (

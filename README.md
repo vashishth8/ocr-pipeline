@@ -14,15 +14,19 @@ or would obscure where output came from.
 ```mermaid
 flowchart LR
     A[PDF page] --> B[PyMuPDF inspection]
-    B -->|Usable native text| C[Native text]
+    B -->|Usable, non-image-dominant text| C[Native text]
     B -->|Scanned, mixed, or OCR-needed| D[Tesseract]
     D --> E{Quality gate}
-    E -->|Accepted| F[Tesseract text]
-    E -->|Rejected| G[Surya fallback]
-    D -->|Structure risk enabled| G
-    C --> H[One authoritative result per page]
-    F --> H
-    G --> H
+    E -->|Accepted, no structure escalation| F[Tesseract text]
+    E -->|Rejected| G[Surya text + layout]
+    E -->|Accepted + structure risk| H[Surya layout]
+    H --> I{Hybrid validation passes?}
+    I -->|Yes| K[Surya layout + Tesseract text]
+    I -->|No| G
+    C --> J[Authoritative result]
+    F --> J[Authoritative result]
+    G --> J
+    K --> J
 ```
 
 | Capability | What it provides |
@@ -31,7 +35,7 @@ flowchart LR
 | Quality-gated OCR | Uses Tesseract confidence and text-quality signals before escalating. |
 | Optional structure awareness | Sends table- or column-risk pages to Surya when `--structure-aware` is enabled. |
 | Resume-safe output | Appends completed page records so interrupted jobs can continue. |
-| Provenance-rich JSON | Preserves native, Tesseract, and Surya evidence separately while selecting one result per page. |
+| Provenance-rich JSON | Preserves native, Tesseract, and Surya evidence separately; structure routes can combine Surya layout with audited Tesseract region text. |
 
 ## Requirements
 
@@ -68,10 +72,13 @@ python pdf_pipeline.py inputs --dry-run
 Process a local folder into an ignored artifact directory:
 
 ```bash
-python pdf_pipeline.py inputs --output-dir artifacts/ocr
+python pdf_pipeline.py inputs --output-dir artifacts/ocr-default
 
 # For layouts where table and multi-column structure matter:
-python pdf_pipeline.py inputs --output-dir artifacts/ocr --structure-aware
+python pdf_pipeline.py inputs --output-dir artifacts/ocr-structure --structure-aware
+
+# Keep Surya's own text on those structure routes if comparison is preferred:
+python pdf_pipeline.py inputs --output-dir artifacts/ocr-structure-surya-text --structure-aware --no-structure-hybrid-text
 ```
 
 Use `--shard-count` and `--shard-index` to select deterministic subsets of a
@@ -94,8 +101,19 @@ artifacts/ocr/report/
 ```
 
 `report_rich.json` keeps native PDF spans, Tesseract word geometry, and Surya
-blocks in separate layers. The `authoritative` layer is the single selected
-result for a page; it does not concatenate competing OCR outputs.
+blocks in separate layers. Normally the `authoritative` layer is one selected
+engine result. On a quality-accepted structure escalation, it can instead use
+Surya regions and high-confidence overlapping Tesseract words. Each
+hybridized authoritative block records its layout engine, text engine, original
+Surya text, selected Tesseract word orders, and content/order agreement. A
+hybrid applies only when every textual Surya region has the exact canonical
+Tesseract token sequence, with no unassigned high-confidence words. Tables are
+re-ordered from word geometry; signed and numeric values must also match.
+Otherwise the page remains pure Surya. The raw engine layers remain unselected
+evidence and explicitly record what they contributed to the top-level
+`authoritative` result. The unchanged Surya result keeps its HTML and parsed
+table cells as structural evidence, while authoritative block text is marked
+as Tesseract-derived.
 
 Job fingerprints store a basename, size, and SHA-256 digest instead of an
 absolute input path. Artifacts still contain extracted document content, so
@@ -125,13 +143,18 @@ compares two saved evaluation results. `run_chandra.py` is an optional hosted
 OCR adapter; it uploads the supplied PDF to an external service, so review that
 provider's current terms, cost, and data handling before using it.
 
+Structure scores use evidence-backed one-to-one block matches rather than
+label counts. Reading-order results include match coverage and are marked
+inconclusive when coverage is too low; bbox evidence is used only when both
+artifacts declare the same normalized PDF coordinate frame.
+
 ## Test
 
 The test suite uses synthetic PDFs and does not need a model download, service
 credential, or private document:
 
 ```bash
-python -m unittest -v test_pdf_pipeline.py
+python -m unittest discover -v
 ```
 
 ## Privacy and publishing

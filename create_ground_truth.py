@@ -29,6 +29,15 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
+try:
+    import pymupdf as fitz
+except ImportError as exc:
+    raise SystemExit("PyMuPDF is required: ./sttl/bin/python -m pip install PyMuPDF") from exc
+
+
+PDF_POINT_FRAME = "pdf_page_points_top_left_unrotated"
+POPPLER_DISPLAY_FRAME = "poppler_display_page_points"
+
 
 def norm(text: str) -> str:
     text = (text or "").replace("\u00ad", "")
@@ -44,6 +53,71 @@ def bbox_union(boxes):
         min(b[1] for b in boxes),
         max(b[2] for b in boxes),
         max(b[3] for b in boxes),
+    ]
+
+
+def _float_bbox(value):
+    """Return four finite float coordinates, or raise a useful error."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(f"Expected a four-coordinate bbox, got {value!r}")
+    try:
+        bbox = [float(coordinate) for coordinate in value]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"BBox contains a non-numeric coordinate: {value!r}") from exc
+    if not all(float("-inf") < coordinate < float("inf") for coordinate in bbox):
+        raise ValueError(f"BBox contains a non-finite coordinate: {value!r}")
+    return bbox
+
+
+def pymupdf_unrotated_page_bbox(page: fitz.Page) -> list[float]:
+    """Return the crop-local, unrotated envelope used by the OCR pipeline."""
+    rect = page.rect * page.derotation_matrix
+    return [float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)]
+
+
+def poppler_bbox_to_pymupdf_points(
+    bbox,
+    *,
+    page: fitz.Page,
+) -> list[float]:
+    """Map a Poppler display-space bbox into PyMuPDF's unrotated page frame.
+
+    ``pdftotext -bbox-layout`` reports points in the visible, rotated page
+    frame.  PyMuPDF's text and pipeline output instead use crop-local,
+    unrotated page coordinates.  Poppler's coordinates are already PDF
+    points, so apply PyMuPDF's own derotation matrix to every corner.
+    Importantly, Poppler's ``<page width height>`` metadata stays in the
+    *unrotated* orientation on right-angle rotated pages even while its word
+    bboxes are in the visible display orientation.  Using that metadata to
+    scale coordinates would therefore stretch a 90/270-degree page.  The
+    source points are instead placed directly in ``page.rect`` and derotated.
+    Transforming all four corners is essential at 90/270 degrees because the
+    axes swap and one axis reverses.
+    """
+    source = _float_bbox(bbox)
+    displayed = page.rect
+    if displayed.width <= 0 or displayed.height <= 0:
+        raise ValueError("PyMuPDF page rectangle must have positive dimensions")
+
+    def transform(x: float, y: float) -> list[float]:
+        displayed_point = fitz.Point(
+            displayed.x0 + x,
+            displayed.y0 + y,
+        )
+        point = displayed_point * page.derotation_matrix
+        return [float(point.x), float(point.y)]
+
+    corners = [
+        transform(source[0], source[1]),
+        transform(source[2], source[1]),
+        transform(source[2], source[3]),
+        transform(source[0], source[3]),
+    ]
+    return [
+        min(point[0] for point in corners),
+        min(point[1] for point in corners),
+        max(point[0] for point in corners),
+        max(point[1] for point in corners),
     ]
 
 
@@ -66,7 +140,9 @@ def block_text(words):
 
 def parse_pdf(pdf_path: Path, xml_path: Path):
     subprocess.run(
-        ["pdftotext", "-bbox-layout", str(pdf_path), str(xml_path)],
+        # The cascade renders PyMuPDF's visible CropBox.  Ask Poppler for the
+        # same page envelope before converting its displayed-page coordinates.
+        ["pdftotext", "-cropbox", "-bbox-layout", str(pdf_path), str(xml_path)],
         check=True,
     )
 
@@ -80,43 +156,73 @@ def parse_pdf(pdf_path: Path, xml_path: Path):
         raise RuntimeError("pdftotext returned no <page> nodes")
 
     pages = []
+    with fitz.open(pdf_path) as document:
+        if len(page_nodes) != document.page_count:
+            raise RuntimeError(
+                "pdftotext page count does not match the source PDF "
+                f"({len(page_nodes)} != {document.page_count})"
+            )
 
-    for page_no, page in enumerate(page_nodes, 1):
-        width = float(page.get("width", 0))
-        height = float(page.get("height", 0))
+        for page_no, poppler_page in enumerate(page_nodes, 1):
+            poppler_width = float(poppler_page.get("width", 0))
+            poppler_height = float(poppler_page.get("height", 0))
+            pymupdf_page = document[page_no - 1]
+            unrotated_bbox = pymupdf_unrotated_page_bbox(pymupdf_page)
 
-        all_words = []
-        native_blocks = []
+            all_words = []
+            native_blocks = []
 
-        for native_index, raw_block in enumerate(page.find_all("block")):
-            words = []
-            for raw_word in raw_block.find_all("word"):
-                w = extract_word(raw_word)
-                if w:
+            for native_index, raw_block in enumerate(poppler_page.find_all("block")):
+                words = []
+                for raw_word in raw_block.find_all("word"):
+                    w = extract_word(raw_word)
+                    if not w:
+                        continue
+                    source_bbox = [w["x0"], w["y0"], w["x1"], w["y1"]]
+                    mapped_bbox = poppler_bbox_to_pymupdf_points(
+                        source_bbox,
+                        page=pymupdf_page,
+                    )
+                    w["source_bbox"] = source_bbox
+                    w["source_coordinate_space"] = "poppler_display_points"
+                    w["source_coordinate_frame"] = POPPLER_DISPLAY_FRAME
+                    w["x0"], w["y0"], w["x1"], w["y1"] = mapped_bbox
+                    w["coordinate_space"] = "pdf_points"
+                    w["coordinate_frame"] = PDF_POINT_FRAME
                     words.append(w)
                     all_words.append(w)
 
-            if words:
-                native_blocks.append(
-                    {
-                        "native_index": native_index,
-                        "words": words,
-                        "text": block_text(words),
-                        "bbox": bbox_union(
-                            [[w["x0"], w["y0"], w["x1"], w["y1"]] for w in words]
-                        ),
-                    }
-                )
+                if words:
+                    native_blocks.append(
+                        {
+                            "native_index": native_index,
+                            "words": words,
+                            "text": block_text(words),
+                            "bbox": bbox_union(
+                                [[w["x0"], w["y0"], w["x1"], w["y1"]] for w in words]
+                            ),
+                            "coordinate_space": "pdf_points",
+                            "coordinate_frame": PDF_POINT_FRAME,
+                        }
+                    )
 
-        pages.append(
-            {
-                "page": page_no,
-                "width": width,
-                "height": height,
-                "words": all_words,
-                "native_blocks": native_blocks,
-            }
-        )
+            pages.append(
+                {
+                    "page": page_no,
+                    "width": unrotated_bbox[2] - unrotated_bbox[0],
+                    "height": unrotated_bbox[3] - unrotated_bbox[1],
+                    "bbox": unrotated_bbox,
+                    "coordinate_space": "pdf_points",
+                    "coordinate_frame": PDF_POINT_FRAME,
+                    "poppler_display_bbox": [
+                        float(pymupdf_page.rect.x0), float(pymupdf_page.rect.y0),
+                        float(pymupdf_page.rect.x1), float(pymupdf_page.rect.y1),
+                    ],
+                    "poppler_reported_page_bbox": [0.0, 0.0, poppler_width, poppler_height],
+                    "words": all_words,
+                    "native_blocks": native_blocks,
+                }
+            )
 
     return pages
 
@@ -235,8 +341,9 @@ def detect_repeated_headers(all_pages):
 
     for page in all_pages:
         seen = set()
+        page_top = page.get("bbox", [0.0, 0.0, page["width"], page["height"]])[1]
         for line in build_visual_lines(page["words"]):
-            if line["bbox"][1] <= page["height"] * 0.15:
+            if line["bbox"][1] <= page_top + page["height"] * 0.15:
                 t = norm(line["text"]).lower()
                 if t and t not in seen:
                     counts[t] += 1
@@ -254,19 +361,23 @@ def build_structure_page(page, repeated_headers):
     header_idxs = set()
     footer_idxs = set()
 
+    page_bbox = page.get("bbox", [0.0, 0.0, page["width"], page["height"]])
+    page_top = page_bbox[1]
+    page_bottom = page_bbox[3]
+
     for i, line in enumerate(lines):
         text = norm(line["text"])
         y0, y1 = line["bbox"][1], line["bbox"][3]
 
         if (
             text.lower() in repeated_headers
-            and y0 <= page["height"] * 0.15
+            and y0 <= page_top + page["height"] * 0.15
         ):
             header_idxs.add(i)
 
         if (
             is_page_number(text)
-            and y1 >= page["height"] * 0.90
+            and y1 >= page_bottom - page["height"] * 0.10
         ):
             footer_idxs.add(i)
 
@@ -395,7 +506,7 @@ def build_structure_page(page, repeated_headers):
             h = block["bbox"][3] - block["bbox"][1]
             if (
                 len(t) <= 3
-                and page["height"] * 0.18 < block["bbox"][1] < page["height"] * 0.88
+                and page_top + page["height"] * 0.18 < block["bbox"][1] < page_top + page["height"] * 0.88
                 and h > 0
             ):
                 continue
@@ -404,6 +515,8 @@ def build_structure_page(page, repeated_headers):
     for order, block in enumerate(cleaned):
         block["id"] = f'p{page["page"]}-b{order}'
         block["reading_order"] = order
+        block["coordinate_space"] = "pdf_points"
+        block["coordinate_frame"] = PDF_POINT_FRAME
 
     summary = Counter(b["type"] for b in cleaned)
 
@@ -411,6 +524,9 @@ def build_structure_page(page, repeated_headers):
         "page": page["page"],
         "width": page["width"],
         "height": page["height"],
+        "bbox": page_bbox,
+        "coordinate_space": "pdf_points",
+        "coordinate_frame": PDF_POINT_FRAME,
         "blocks": cleaned,
         "reading_order": [b["id"] for b in cleaned],
         "structure_summary": dict(summary),
@@ -450,6 +566,13 @@ def main(argv: list[str] | None = None) -> int:
             "page": page["page"],
             "width": page["width"],
             "height": page["height"],
+            "bbox": page["bbox"],
+            "coordinate_space": "pdf_points",
+            "coordinate_frame": PDF_POINT_FRAME,
+            "source_coordinate_space": "poppler_display_points",
+            "source_coordinate_frame": POPPLER_DISPLAY_FRAME,
+            "source_bbox": page["poppler_display_bbox"],
+            "source_reported_page_bbox": page["poppler_reported_page_bbox"],
             "words": page["words"],
             "text": " ".join(w["text"] for w in page["words"]),
         })
@@ -495,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
                     "structure.json is conservative silver structure.",
                     "Diagram-internal PDF text is not trusted as text ground truth.",
                     "Unknown regions are not forced into semantic classes.",
+                    "Geometry uses normalized top-left PDF page points; rotated pages are compared only when page envelopes agree.",
                 ],
                 "page_count": len(structure_pages),
                 "pages": structure_pages,
