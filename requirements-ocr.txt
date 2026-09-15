@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# The pipeline's Surya adapter is validated against this CLI generation.
+surya-ocr==0.22.1

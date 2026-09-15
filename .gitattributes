@@ -1,0 +1,9 @@
+# Keep repository text consistent across platforms.
+* text=auto eol=lf
+
+# Treat document and image assets as binary if deliberately added later.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.xlsx binary

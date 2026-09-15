@@ -1,0 +1,45 @@
+# Python bytecode, test caches, and virtual environments
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+ENV/
+sttl/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Private source documents and local OCR artifacts
+*.pdf
+*.xlsx
+inputs/
+data/
+private/
+artifacts/
+results/
+evaluation/
+ground_truth/
+benchmark_results/
+*.log

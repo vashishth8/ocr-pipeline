@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a reproducible problem in STTL.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use only sanitized inputs. Do not include PDFs, extracted text, credentials, signed URLs, or personal data.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Provide commands, sanitized logs, and a synthetic fixture where possible.
+      placeholder: |
+        1. Run ...
+        2. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: STTL commit or version
+      placeholder: abc1234
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and relevant OCR runtime versions.
