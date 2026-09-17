@@ -646,5 +646,10 @@ Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request and
 
 ## License
 
-No license has been selected yet. Add one before publishing this project for
-reuse or accepting contributions under defined terms.
+STTL's source code is licensed under the [Apache License 2.0](LICENSE).
+
+This license applies to this repository's code and documentation, not to
+separately obtained OCR engines, model weights, input documents, or hosted
+services. In particular, the optional Surya code is Apache-2.0, while its
+model weights have separate modified OpenRAIL-M terms; review those terms
+before redistribution or commercial deployment.

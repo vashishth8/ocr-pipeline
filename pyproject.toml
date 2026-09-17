@@ -6,6 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "sttl"
 description = "A resumable, page-aware PDF OCR pipeline"
 readme = "README.md"
+license = { file = "LICENSE" }
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+]
 dynamic = ["version"]
 requires-python = ">=3.11,<3.12"
 dependencies = [

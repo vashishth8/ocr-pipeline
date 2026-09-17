@@ -41,6 +41,7 @@ from typing import Any
 
 from sttl.gates import (
     PipelineConfig,
+    _unicode_word_char,
     _unicode_word_tokens,
     classify_page_signals,
     garbage_ratio,
@@ -70,6 +71,7 @@ from sttl.text import html_to_text, normalize_whitespace
 from sttl.version import PIPELINE_VERSION
 
 __all__ = [
+    "_unicode_word_char",
     "classify_page_signals",
     "garbage_ratio",
     "pipeline_description",

@@ -30,6 +30,12 @@ private sample document, a model download, or service credentials.
 - Run `make check` and the full test suite before opening the pull request.
 - Keep generated outputs out of the diff.
 
+## Contributor license
+
+By submitting a contribution for inclusion in STTL, you agree to license it
+under the [Apache License 2.0](LICENSE), unless a separate written agreement
+states otherwise. This mirrors the contribution terms in the project license.
+
 ## Data handling
 
 Do not commit source PDFs, screenshots, OCR output, raw provider responses,
