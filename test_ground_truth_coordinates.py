@@ -18,7 +18,9 @@ from create_ground_truth import (
 )
 
 
-@unittest.skipUnless(shutil.which("pdftotext"), "pdftotext is required for ground-truth coordinate tests")
+@unittest.skipUnless(
+    shutil.which("pdftotext"), "pdftotext is required for ground-truth coordinate tests"
+)
 class PopplerCoordinateNormalizationTests(unittest.TestCase):
     def test_rotated_poppler_words_align_with_pymupdf_unrotated_words(self) -> None:
         """Right-angle rotations must not leave reference boxes in display space."""
@@ -39,7 +41,9 @@ class PopplerCoordinateNormalizationTests(unittest.TestCase):
 
             document = fitz.open(pdf_path)
             try:
-                for page_number, (reference, page) in enumerate(zip(reference_pages, document), start=1):
+                for _page_number, (reference, page) in enumerate(
+                    zip(reference_pages, document, strict=False), start=1
+                ):
                     expected_bbox = pymupdf_unrotated_page_bbox(page)
                     self.assertEqual(reference["coordinate_frame"], PDF_POINT_FRAME)
                     self.assertEqual(reference["bbox"], expected_bbox)
@@ -57,7 +61,9 @@ class PopplerCoordinateNormalizationTests(unittest.TestCase):
                     for text, native_bbox in native_words.items():
                         reference_word = reference_words[text]
                         self.assertEqual(reference_word["coordinate_frame"], PDF_POINT_FRAME)
-                        self.assertEqual(reference_word["source_coordinate_frame"], POPPLER_DISPLAY_FRAME)
+                        self.assertEqual(
+                            reference_word["source_coordinate_frame"], POPPLER_DISPLAY_FRAME
+                        )
                         self.assertEqual(len(reference_word["source_bbox"]), 4)
                         reference_center = (
                             (reference_word["x0"] + reference_word["x1"]) / 2,

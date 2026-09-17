@@ -15,7 +15,8 @@ dist/
 venv/
 env/
 ENV/
-sttl/
+# Legacy root-level virtual environment name. Source lives at src/sttl/.
+/sttl/
 
 # Local configuration and credentials
 .env
@@ -34,6 +35,7 @@ Thumbs.db
 # Private source documents and local OCR artifacts
 *.pdf
 *.xlsx
+tmp/
 inputs/
 data/
 private/

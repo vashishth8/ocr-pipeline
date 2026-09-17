@@ -1,0 +1,4 @@
+# Downloaded OCR language packs stay local; install scripts and documentation
+# describe their source rather than committing model binaries.
+*
+!.gitignore

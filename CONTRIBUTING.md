@@ -5,14 +5,18 @@ easiest to review and validate.
 
 ## Local setup
 
-Use Python 3.11 for the same environment used by continuous integration:
+Use Python 3.11 for the same environment used by continuous integration. Keep
+the virtual environment at `.venv/`; the historical `sttl/` path is ignored
+for compatibility and must not be used for source code.
 
 ```bash
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python -m unittest -v test_pdf_pipeline.py
+python -m pip install -r requirements.lock
+python -m pip install --no-deps --no-build-isolation -e .
+make check
+make coverage
 ```
 
 Install Tesseract and the optional Surya runtime only when exercising OCR
@@ -23,7 +27,7 @@ private sample document, a model download, or service credentials.
 
 - Explain the user-visible change and its trade-offs.
 - Add or update focused tests for changed routing, parsing, or evaluation logic.
-- Run the unit suite before opening the pull request.
+- Run `make check` and the full test suite before opening the pull request.
 - Keep generated outputs out of the diff.
 
 ## Data handling

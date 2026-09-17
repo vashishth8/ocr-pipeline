@@ -5,6 +5,8 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from subprocess import CalledProcessError
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pymupdf as fitz
@@ -14,18 +16,28 @@ from evaluate_ocr import (
     canonical_label,
     geometry_compatibility,
     load_cascade,
-    main as evaluate_ocr_main,
     order_similarity,
     order_similarity_details,
     page_ocr_blocks,
     structure_scores,
     visual_description_labels,
 )
+from evaluate_ocr import (
+    main as evaluate_ocr_main,
+)
+from evaluate_ocr import (
+    tokens as evaluation_tokens,
+)
+from evaluate_ocr import (
+    wer as evaluation_wer,
+)
 from pdf_pipeline import (
     PipelineConfig,
     _PendingSuryaPage,
+    build_parser,
     canonical_blocks,
     classify_page_signals,
+    config_from_args,
     extract_surya_layout,
     flush_surya,
     html_to_table,
@@ -33,15 +45,21 @@ from pdf_pipeline import (
     page_bbox,
     parse_tesseract_tsv,
     parse_tesseract_tsv_layout,
+    primary_ocr_engine,
     process_document,
     reading_order_check,
     render_page,
     scale_ocr_items_to_pdf_points,
     summarise_document,
-    tesseract_structure_gate,
+    tesseract_page,
     tesseract_quality,
+    tesseract_structure_gate,
+    text_agreement,
+    validate_args,
+    validate_pipeline_config,
 )
-from run_chandra import first_text, main as chandra_main, normalize_chandra
+from run_chandra import first_text, normalize_chandra
+from run_chandra import main as chandra_main
 
 
 class PipelineUnitTests(unittest.TestCase):
@@ -51,16 +69,49 @@ class PipelineUnitTests(unittest.TestCase):
     def test_usable_native_text_is_digital(self) -> None:
         result = classify_page_signals(
             text="This is a normal digital PDF page with enough useful text. " * 3,
-            text_block_count=3, image_count=0, image_area_ratio=0.0, config=self.config,
+            text_block_count=3,
+            image_count=0,
+            image_area_ratio=0.0,
+            config=self.config,
         )
         self.assertEqual((result["classification"], result["route"]), ("DIGITAL", "native_text"))
 
     def test_dominant_image_with_text_is_mixed(self) -> None:
         result = classify_page_signals(
             text="This page has native text but the visual scan is dominant. " * 3,
-            text_block_count=2, image_count=1, image_area_ratio=0.9, config=self.config,
+            text_block_count=2,
+            image_count=1,
+            image_area_ratio=0.9,
+            config=self.config,
         )
         self.assertEqual((result["classification"], result["route"]), ("MIXED", "tesseract"))
+
+    def test_private_use_native_text_is_auditable_and_strict_profile_routes_it(self) -> None:
+        # A custom-font PDF can contain a tiny amount of private-use Unicode
+        # amid otherwise valid native text. The regular profile permits its
+        # configured 5% garbage allowance; a strict zero-garbage pilot profile
+        # makes the page route to local OCR without a code-path special case.
+        text = ("यह एक पर्याप्त लंबा हिंदी परीक्षण पाठ है। " * 10) + "\ue019"
+        ordinary = classify_page_signals(
+            text=text,
+            text_block_count=2,
+            image_count=0,
+            image_area_ratio=0.0,
+            config=self.config,
+        )
+        self.assertEqual(ordinary["signals"]["native_private_use_count"], 1)
+        self.assertEqual(
+            (ordinary["classification"], ordinary["route"]), ("DIGITAL", "native_text")
+        )
+
+        strict = classify_page_signals(
+            text=text,
+            text_block_count=2,
+            image_count=0,
+            image_area_ratio=0.0,
+            config=PipelineConfig(max_native_garbage_ratio=0.0),
+        )
+        self.assertEqual((strict["classification"], strict["route"]), ("OCR_NEEDED", "tesseract"))
 
     def test_tsv_quality_gate(self) -> None:
         tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
@@ -70,9 +121,139 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertEqual(text, "Reliable OCR text here")
         self.assertTrue(tesseract_quality(text, confidences, self.config)["accepted"])
 
+    def test_hindi_quality_and_comparison_preserve_devanagari_marks(self) -> None:
+        text = "यह हिंदी भाषा का पर्याप्त परीक्षण पाठ है और भारत में हिंदी बोली जाती है।"
+        quality = tesseract_quality(
+            text, [93.0] * len(text.split()), PipelineConfig(language="hin")
+        )
+        self.assertTrue(quality["accepted"], quality)
+        self.assertEqual(quality["plausible_word_ratio"], 1.0)
+
+        agreement = text_agreement("हिंदी", "हिदी")
+        self.assertEqual(agreement["token_f1"], 0.0)
+        self.assertEqual(agreement["sequence_ratio"], 0.0)
+        self.assertEqual(evaluation_tokens("हिंदी भाषा।"), ["हिंदी", "भाषा"])
+        self.assertEqual(evaluation_wer("हिंदी", "हिदी"), 1.0)
+        # Canonically equivalent Devanagari encodings should compare equally.
+        self.assertEqual(evaluation_tokens("क़िला"), evaluation_tokens("क़िला"))
+
+    def test_hindi_auto_prefers_surya_but_compact_profile_stays_tesseract(self) -> None:
+        # The accuracy-first Hindi route should select Surya automatically,
+        # including for code-mixed and script-name language settings. A caller
+        # can still make its compact resource choice explicit and deterministic.
+        self.assertEqual(primary_ocr_engine(PipelineConfig(language="hin")), "surya")
+        self.assertEqual(primary_ocr_engine(PipelineConfig(language="hin+eng")), "surya")
+        self.assertEqual(primary_ocr_engine(PipelineConfig(language="script/Devanagari")), "surya")
+        self.assertEqual(primary_ocr_engine(PipelineConfig(language="eng")), "tesseract")
+        self.assertEqual(
+            primary_ocr_engine(PipelineConfig(language="hin", fallback_engine="none")),
+            "tesseract",
+        )
+        self.assertEqual(
+            primary_ocr_engine(PipelineConfig(language="hin", ocr_engine="tesseract")),
+            "tesseract",
+        )
+
+    def test_hindi_dry_run_reports_resolved_primary_plan_without_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pdf_path = root / "hindi-plan.pdf"
+            document = fitz.open()
+            document.new_page()
+            document.new_page()
+            document.save(pdf_path)
+            document.close()
+            native = {
+                "classification": "DIGITAL",
+                "route": "native_text",
+                "signals": {},
+                "native_text": "usable native text",
+            }
+            ocr_needed = {
+                "classification": "OCR_NEEDED",
+                "route": "tesseract",
+                "signals": {},
+                "native_text": "",
+            }
+            with patch("pdf_pipeline.inspect_page", side_effect=[native, ocr_needed]):
+                plan = process_document(
+                    pdf_path,
+                    input_root=root,
+                    output_root=root / "output",
+                    config=PipelineConfig(language="hin"),
+                    dry_run=True,
+                )
+
+        self.assertEqual(plan["state"], "dry_run")
+        self.assertEqual(plan["primary_ocr_engine"], "surya")
+        self.assertEqual(plan["ocr_candidate_pages"], 1)
+        self.assertEqual(plan["planned_surya_primary_pages"], 1)
+        self.assertEqual(plan["planned_tesseract_primary_pages"], 0)
+
+    def test_missing_hindi_tesseract_data_has_an_actionable_error(self) -> None:
+        failure = CalledProcessError(
+            1,
+            ["tesseract"],
+            stderr="Failed loading language 'hin'\nCould not initialize tesseract.",
+        )
+        with (
+            patch("pdf_pipeline.executable_for", return_value="tesseract"),
+            patch("pdf_pipeline.subprocess.run", side_effect=failure),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "language data for 'hin' is unavailable"):
+                tesseract_page(Path("page.png"), PipelineConfig(language="hin"))
+
+    def test_missing_local_tesseract_data_names_the_local_verification_command(self) -> None:
+        failure = CalledProcessError(
+            1,
+            ["tesseract"],
+            stderr="Failed loading language 'hin'\nCould not initialize tesseract.",
+        )
+        with (
+            patch("pdf_pipeline.executable_for", return_value="tesseract"),
+            patch("pdf_pipeline.subprocess.run", side_effect=failure),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"tesseract --list-langs --tessdata-dir models/tessdata",
+            ):
+                tesseract_page(
+                    Path("page.png"),
+                    PipelineConfig(language="hin", tessdata_dir="models/tessdata"),
+                )
+
+    def test_workspace_tessdata_directory_is_forwarded_to_tesseract(self) -> None:
+        tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+        for number, word in enumerate(("यह", "हिंदी", "OCR", "पाठ"), 1):
+            tsv += f"5\t1\t1\t1\t1\t{number}\t0\t0\t1\t1\t93.0\t{word}\n"
+        with (
+            patch("pdf_pipeline.executable_for", return_value="tesseract"),
+            patch("pdf_pipeline.subprocess.run", return_value=SimpleNamespace(stdout=tsv)) as run,
+        ):
+            tesseract_page(
+                Path("page.png"),
+                PipelineConfig(language="hin", tessdata_dir="models/tessdata"),
+            )
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "tesseract",
+                "page.png",
+                "stdout",
+                "--tessdata-dir",
+                "models/tessdata",
+                "-l",
+                "hin",
+                "--psm",
+                "3",
+                "-c",
+                "tessedit_create_tsv=1",
+            ],
+        )
+
     def test_tsv_parser_keeps_following_rows_after_a_literal_quote(self) -> None:
         tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
-        tsv += "5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t90\tquoted\"word\n"
+        tsv += '5\t1\t1\t1\t1\t1\t0\t0\t1\t1\t90\tquoted"word\n'
         tsv += "5\t1\t1\t1\t1\t2\t0\t0\t1\t1\t91\tafterward\n"
         text, confidences = parse_tesseract_tsv(tsv)
         self.assertEqual(text, 'quoted"word afterward')
@@ -84,7 +265,9 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertIn("low_mean_confidence", quality["rejection_reasons"])
 
     def test_surya_html_text(self) -> None:
-        text = html_to_text("<table><tr><th>Item</th><th>Value</th></tr><tr><td>A</td><td>10</td></tr></table>")
+        text = html_to_text(
+            "<table><tr><th>Item</th><th>Value</th></tr><tr><td>A</td><td>10</td></tr></table>"
+        )
         self.assertIn("Item Value", text)
         self.assertIn("A 10", text)
 
@@ -138,7 +321,13 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertEqual(len(canonical_blocks(blocks)), 3)
 
     def test_ocr_bboxes_are_scaled_to_pdf_points_and_source_retained(self) -> None:
-        items = [{"text": "word", "bbox": [100, 50, 300, 150], "polygon": [[100, 50], [300, 50], [300, 150], [100, 150]]}]
+        items = [
+            {
+                "text": "word",
+                "bbox": [100, 50, 300, 150],
+                "polygon": [[100, 50], [300, 50], [300, 150], [100, 150]],
+            }
+        ]
         raster = {
             "raster_width": 1000,
             "raster_height": 500,
@@ -165,15 +354,22 @@ class PipelineUnitTests(unittest.TestCase):
             document = fitz.open(pdf_path)
             page = document[0]
             raster = render_page(page, root / "rotated.png", 72)
-            scaled = scale_ocr_items_to_pdf_points([{
-                "text": "word",
-                "bbox": [60, 20, 80, 40],
-                "polygon": [[60, 20], [80, 20], [80, 40], [60, 40]],
-            }], raster)[0]
+            scaled = scale_ocr_items_to_pdf_points(
+                [
+                    {
+                        "text": "word",
+                        "bbox": [60, 20, 80, 40],
+                        "polygon": [[60, 20], [80, 20], [80, 40], [60, 40]],
+                    }
+                ],
+                raster,
+            )[0]
             self.assertEqual(raster["rendered_pdf_bbox"], [0.0, 0.0, 100.0, 200.0])
             self.assertEqual(raster["pdf_bbox"], [0.0, 0.0, 200.0, 100.0])
             self.assertEqual(scaled["bbox"], [20.0, 20.0, 40.0, 40.0])
-            self.assertEqual(scaled["polygon"], [[20.0, 40.0], [20.0, 20.0], [40.0, 20.0], [40.0, 40.0]])
+            self.assertEqual(
+                scaled["polygon"], [[20.0, 40.0], [20.0, 20.0], [40.0, 20.0], [40.0, 40.0]]
+            )
             self.assertEqual(page_bbox(page), [0.0, 0.0, 200.0, 100.0])
             native_bbox = page.get_text("dict")["blocks"][0]["bbox"]
             self.assertLessEqual(native_bbox[2], page_bbox(page)[2])
@@ -181,7 +377,9 @@ class PipelineUnitTests(unittest.TestCase):
             document.close()
 
     def test_html_table_preserves_header_and_spans(self) -> None:
-        table = html_to_table("<table><tr><th rowspan='2'>Header</th><th>Value</th></tr><tr><td>10<br/>20</td></tr></table>")
+        table = html_to_table(
+            "<table><tr><th rowspan='2'>Header</th><th>Value</th></tr><tr><td>10<br/>20</td></tr></table>"
+        )
         self.assertIsNotNone(table)
         assert table is not None
         self.assertTrue(table["rows"][0][0]["is_header"])
@@ -194,21 +392,32 @@ class PipelineUnitTests(unittest.TestCase):
             pdf_path = root / "digital.pdf"
             document = fitz.open()
             page = document.new_page()
-            page.insert_text((72, 72), "A sufficiently long native text page for the production OCR pipeline. " * 4)
+            page.insert_text(
+                (72, 72),
+                "A sufficiently long native text page for the production OCR pipeline. " * 4,
+            )
             document.save(pdf_path)
             document.close()
 
             output_root = root / "output"
             first = process_document(
-                pdf_path, input_root=root, output_root=output_root, config=self.config,
+                pdf_path,
+                input_root=root,
+                output_root=output_root,
+                config=self.config,
             )
             second = process_document(
-                pdf_path, input_root=root, output_root=output_root, config=self.config,
+                pdf_path,
+                input_root=root,
+                output_root=output_root,
+                config=self.config,
             )
             self.assertEqual(first["state"], "complete")
             self.assertEqual(second["native_pages"], 1)
             job_dir = output_root / "digital"
-            records = [json.loads(line) for line in (job_dir / "pages.jsonl").read_text().splitlines()]
+            records = [
+                json.loads(line) for line in (job_dir / "pages.jsonl").read_text().splitlines()
+            ]
             self.assertEqual(len(records), 1)
             self.assertTrue((job_dir / "combined.txt").is_file())
             job = json.loads((job_dir / "job.json").read_text())
@@ -238,7 +447,9 @@ class PipelineUnitTests(unittest.TestCase):
         text, confidences, words, blocks = parse_tesseract_tsv_layout(tsv)
         self.assertEqual(text, "First line Second")
         self.assertEqual(len(words), 3)
-        self.assertEqual(words[0]["source_tsv"], {"page": 1, "block": 1, "paragraph": 1, "line": 1, "word": 1})
+        self.assertEqual(
+            words[0]["source_tsv"], {"page": 1, "block": 1, "paragraph": 1, "line": 1, "word": 1}
+        )
         self.assertEqual([block["reading_order"] for block in blocks], [1, 2])
         self.assertEqual(blocks[0]["source_tsv"]["line"], 1)
         self.assertTrue(reading_order_check(blocks)["contiguous_block_order"])
@@ -272,10 +483,12 @@ class PipelineUnitTests(unittest.TestCase):
         words: list[dict] = []
         for line in range(1, 6):
             y0 = 100 + (line - 1) * 60
-            words.extend([
-                self._word(f"Item{line}", 80, y0, 150, y0 + 20, block=1, line=line, word=1),
-                self._word(f"Value{line}", 520, y0, 600, y0 + 20, block=1, line=line, word=2),
-            ])
+            words.extend(
+                [
+                    self._word(f"Item{line}", 80, y0, 150, y0 + 20, block=1, line=line, word=1),
+                    self._word(f"Value{line}", 520, y0, 600, y0 + 20, block=1, line=line, word=2),
+                ]
+            )
         return words
 
     def test_structure_gate_detects_repeated_aligned_columns(self) -> None:
@@ -293,10 +506,18 @@ class PipelineUnitTests(unittest.TestCase):
             y0 = 100 + (line - 1) * 60
             for word in range(1, 7):
                 x0 = 80 + (word - 1) * 45
-                words.append(self._word(
-                    f"word{word}", x0, y0, x0 + 35, y0 + 20,
-                    block=1, line=line, word=word,
-                ))
+                words.append(
+                    self._word(
+                        f"word{word}",
+                        x0,
+                        y0,
+                        x0 + 35,
+                        y0 + 20,
+                        block=1,
+                        line=line,
+                        word=word,
+                    )
+                )
         gate = tesseract_structure_gate(words, {"raster_width": 800, "raster_height": 1_000})
         self.assertFalse(gate["escalate"])
         self.assertEqual(gate["reasons"], [])
@@ -308,10 +529,18 @@ class PipelineUnitTests(unittest.TestCase):
                 y0 = 50 + (line - 1) * 80
                 for word in range(1, 9):
                     x0 = start_x + (word - 1) * 24
-                    words.append(self._word(
-                        f"b{block}w{word}", x0, y0, x0 + 18, y0 + 20,
-                        block=block, line=line, word=word,
-                    ))
+                    words.append(
+                        self._word(
+                            f"b{block}w{word}",
+                            x0,
+                            y0,
+                            x0 + 18,
+                            y0 + 20,
+                            block=block,
+                            line=line,
+                            word=word,
+                        )
+                    )
         gate = tesseract_structure_gate(words, {"raster_width": 800, "raster_height": 1_000})
         self.assertTrue(gate["escalate"])
         self.assertIn("multiple_text_columns", gate["reasons"])
@@ -323,10 +552,18 @@ class PipelineUnitTests(unittest.TestCase):
             for line in range(1, 3):
                 for word in range(1, 3):
                     x0 = start_x + (word - 1) * 30
-                    words.append(self._word(
-                        f"b{block}w{word}", x0, 100 + line * 30, x0 + 20, 120 + line * 30,
-                        block=block, line=line, word=word,
-                    ))
+                    words.append(
+                        self._word(
+                            f"b{block}w{word}",
+                            x0,
+                            100 + line * 30,
+                            x0 + 20,
+                            120 + line * 30,
+                            block=block,
+                            line=line,
+                            word=word,
+                        )
+                    )
         gate = tesseract_structure_gate(words, {"raster_width": 800, "raster_height": 1_000})
         self.assertFalse(gate["escalate"])
 
@@ -355,21 +592,25 @@ class PipelineUnitTests(unittest.TestCase):
                 "mean_word_confidence": 95.0,
                 "rejection_reasons": [],
             }
-            table_html = "<table><tr><th>Item</th><th>Value</th></tr><tr><td>A</td><td>10</td></tr></table>"
+            table_html = (
+                "<table><tr><th>Item</th><th>Value</th></tr><tr><td>A</td><td>10</td></tr></table>"
+            )
             table = html_to_table(table_html)
             assert table is not None
             prediction = {
                 "page-000001.png": {
                     "text": "Item Value\nA 10",
-                    "blocks": [{
-                        "block_type": "Table",
-                        "type": "table",
-                        "text": "Item Value\nA 10",
-                        "html": table_html,
-                        "table": table,
-                        "bbox": [80, 100, 720, 700],
-                        "polygon": [[80, 100], [720, 100], [720, 700], [80, 700]],
-                    }],
+                    "blocks": [
+                        {
+                            "block_type": "Table",
+                            "type": "table",
+                            "text": "Item Value\nA 10",
+                            "html": table_html,
+                            "table": table,
+                            "bbox": [80, 100, 720, 700],
+                            "polygon": [[80, 100], [720, 100], [720, 700], [80, 700]],
+                        }
+                    ],
                 },
             }
             with (
@@ -377,7 +618,12 @@ class PipelineUnitTests(unittest.TestCase):
                 patch("pdf_pipeline.render_page", return_value=raster),
                 patch(
                     "pdf_pipeline.tesseract_page",
-                    return_value=("Item1 Value1 Item2 Value2", quality, self._aligned_table_words(), []),
+                    return_value=(
+                        "Item1 Value1 Item2 Value2",
+                        quality,
+                        self._aligned_table_words(),
+                        [],
+                    ),
                 ),
                 patch("pdf_pipeline.surya_batch", return_value=prediction),
             ):
@@ -404,7 +650,9 @@ class PipelineUnitTests(unittest.TestCase):
             self.assertFalse(rich_page["layers"]["tesseract5"]["selected"])
             self.assertEqual(rich_page["routing"]["escalation_reason"], "structure")
             self.assertTrue(rich_page["routing"]["structure_gate"]["escalate"])
-            self.assertTrue(rich_page["layers"]["surya"]["blocks"][0]["table"]["rows"][0][0]["is_header"])
+            self.assertTrue(
+                rich_page["layers"]["surya"]["blocks"][0]["table"]["rows"][0][0]["is_header"]
+            )
 
     def test_structure_routing_is_opt_in_and_default_tesseract_route_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -414,17 +662,35 @@ class PipelineUnitTests(unittest.TestCase):
             document.new_page()
             document.save(pdf_path)
             document.close()
-            raster = {"raster_width": 800, "raster_height": 1_000, "pdf_bbox": [0, 0, 595, 842], "dpi": 200}
-            inspection = {"classification": "OCR_NEEDED", "route": "tesseract", "signals": {}, "native_text": ""}
+            raster = {
+                "raster_width": 800,
+                "raster_height": 1_000,
+                "pdf_bbox": [0, 0, 595, 842],
+                "dpi": 200,
+            }
+            inspection = {
+                "classification": "OCR_NEEDED",
+                "route": "tesseract",
+                "signals": {},
+                "native_text": "",
+            }
             quality = {"accepted": True, "mean_word_confidence": 95.0, "rejection_reasons": []}
             with (
                 patch("pdf_pipeline.inspect_page", return_value=inspection),
                 patch("pdf_pipeline.render_page", return_value=raster),
                 patch(
                     "pdf_pipeline.tesseract_page",
-                    return_value=("Item1 Value1 Item2 Value2", quality, self._aligned_table_words(), []),
+                    return_value=(
+                        "Item1 Value1 Item2 Value2",
+                        quality,
+                        self._aligned_table_words(),
+                        [],
+                    ),
                 ),
-                patch("pdf_pipeline.surya_batch", side_effect=AssertionError("default route must not call Surya")),
+                patch(
+                    "pdf_pipeline.surya_batch",
+                    side_effect=AssertionError("default route must not call Surya"),
+                ),
             ):
                 summary = process_document(
                     pdf_path,
@@ -434,36 +700,370 @@ class PipelineUnitTests(unittest.TestCase):
                 )
             self.assertEqual(summary["tesseract_accepted_pages"], 1)
             self.assertEqual(summary["surya_escalated_pages"], 0)
-            record = json.loads((root / "output" / "plain" / "pages.jsonl").read_text(encoding="utf-8").strip())
+            record = json.loads(
+                (root / "output" / "plain" / "pages.jsonl").read_text(encoding="utf-8").strip()
+            )
             self.assertEqual(record["engine"], "tesseract5")
             self.assertNotIn("structure_gate", record)
+
+    def test_primary_surya_bypasses_tesseract_and_is_selected_in_rich_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pdf_path = root / "hindi.pdf"
+            document = fitz.open()
+            document.new_page()
+            document.save(pdf_path)
+            document.close()
+
+            raster = {
+                "raster_width": 800,
+                "raster_height": 1_000,
+                "pdf_bbox": [0, 0, 595, 842],
+                "dpi": 200,
+            }
+            inspection = {
+                "classification": "OCR_NEEDED",
+                "route": "tesseract",
+                "signals": {},
+                "native_text": "",
+            }
+            prediction = {
+                "page-000001.png": {
+                    "text": "भारत सरकार",
+                    "blocks": [
+                        {
+                            "block_type": "Text",
+                            "type": "text",
+                            "text": "भारत सरकार",
+                            "bbox": [80, 100, 480, 160],
+                            "reading_order": 1,
+                        }
+                    ],
+                },
+            }
+            with (
+                patch("pdf_pipeline.inspect_page", return_value=inspection),
+                patch("pdf_pipeline.render_page", return_value=raster),
+                patch(
+                    "pdf_pipeline.tesseract_page",
+                    side_effect=AssertionError("primary Surya route must bypass Tesseract"),
+                ),
+                patch("pdf_pipeline.surya_batch", return_value=prediction) as surya_batch,
+            ):
+                summary = process_document(
+                    pdf_path,
+                    input_root=root,
+                    output_root=root / "output",
+                    config=PipelineConfig(language="hin"),
+                )
+
+            self.assertEqual(summary["surya_primary_pages"], 1)
+            self.assertEqual(summary["surya_escalated_pages"], 0)
+            self.assertEqual(summary["tesseract_accepted_pages"], 0)
+            surya_batch.assert_called_once()
+
+            job_dir = root / "output" / "hindi"
+            record = json.loads((job_dir / "pages.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(record["engine"], "surya")
+            self.assertEqual(record["outcome"], "surya_primary")
+            self.assertEqual(record["route"], "surya")
+            self.assertEqual(record["classifier_route"], "tesseract")
+            self.assertEqual(record["escalation_reason"], "primary")
+            self.assertNotIn("tesseract_quality", record)
+            self.assertNotIn("tesseract_candidate", record)
+
+            rich = json.loads((job_dir / "hindi_rich.json").read_text(encoding="utf-8"))
+            rich_page = rich["pages"][0]
+            self.assertEqual(rich_page["authoritative"]["engine"], "surya")
+            self.assertFalse(rich_page["layers"]["tesseract5"]["attempted"])
+            self.assertTrue(rich_page["layers"]["surya"]["attempted"])
+            self.assertTrue(rich_page["layers"]["surya"]["selected"])
+            self.assertEqual(rich_page["routing"]["route"], "surya")
+            self.assertEqual(rich_page["routing"]["classifier_route"], "tesseract")
+            self.assertEqual(rich_page["routing"]["escalation_reason"], "primary")
+
+    def test_forced_surya_for_english_has_generic_primary_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pdf_path = root / "english.pdf"
+            document = fitz.open()
+            document.new_page()
+            document.save(pdf_path)
+            document.close()
+
+            raster = {
+                "raster_width": 800,
+                "raster_height": 1_000,
+                "pdf_bbox": [0, 0, 595, 842],
+                "dpi": 200,
+            }
+            inspection = {
+                "classification": "OCR_NEEDED",
+                "route": "tesseract",
+                "signals": {},
+                "native_text": "",
+            }
+            prediction = {
+                "page-000001.png": {
+                    "text": "Government Gazette",
+                    "blocks": [
+                        {
+                            "block_type": "Text",
+                            "type": "text",
+                            "text": "Government Gazette",
+                            "bbox": [80, 100, 480, 160],
+                            "reading_order": 1,
+                        }
+                    ],
+                },
+            }
+            with (
+                patch("pdf_pipeline.inspect_page", return_value=inspection),
+                patch("pdf_pipeline.render_page", return_value=raster),
+                patch(
+                    "pdf_pipeline.tesseract_page",
+                    side_effect=AssertionError("forced Surya route must bypass Tesseract"),
+                ),
+                patch("pdf_pipeline.surya_batch", return_value=prediction),
+            ):
+                summary = process_document(
+                    pdf_path,
+                    input_root=root,
+                    output_root=root / "output",
+                    config=PipelineConfig(language="eng", ocr_engine="surya"),
+                )
+
+            self.assertEqual(summary["surya_primary_pages"], 1)
+            job_dir = root / "output" / "english"
+            normalized = json.loads((job_dir / "english_cascade.json").read_text(encoding="utf-8"))
+            rich = json.loads((job_dir / "english_rich.json").read_text(encoding="utf-8"))
+            for artifact in (normalized, rich):
+                self.assertEqual(
+                    artifact["metadata"]["pipeline"], "PyMuPDF -> Surya OCR (primary route)"
+                )
+                self.assertEqual(artifact["metadata"]["routing"]["primary_ocr_engine"], "surya")
+
+    def test_resumed_primary_surya_uses_next_batch_number(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pdf_path = root / "resumed.pdf"
+            document = fitz.open()
+            document.new_page()
+            document.new_page()
+            document.save(pdf_path)
+            document.close()
+
+            job_dir = root / "output" / "resumed"
+            job_dir.mkdir(parents=True)
+            existing = {
+                "page": 1,
+                "status": "complete",
+                "classification": "OCR_NEEDED",
+                "route": "tesseract",
+                "engine": "surya",
+                "outcome": "surya_primary",
+                "signals": {},
+                "native_text": "",
+                "text": "already completed",
+                "surya_batch": 1,
+            }
+            (job_dir / "pages.jsonl").write_text(
+                json.dumps(existing, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            raster = {
+                "raster_width": 800,
+                "raster_height": 1_000,
+                "pdf_bbox": [0, 0, 595, 842],
+                "dpi": 200,
+            }
+            inspection = {
+                "classification": "OCR_NEEDED",
+                "route": "tesseract",
+                "signals": {},
+                "native_text": "",
+            }
+            prediction = {
+                "page-000002.png": {
+                    "text": "नई पंक्ति",
+                    "blocks": [
+                        {
+                            "block_type": "Text",
+                            "type": "text",
+                            "text": "नई पंक्ति",
+                            "bbox": [80, 100, 480, 160],
+                            "reading_order": 1,
+                        }
+                    ],
+                },
+            }
+            with (
+                # The pre-written manifest is the resume fixture; its job
+                # metadata is irrelevant to verifying the persisted batch
+                # counter and would only duplicate check_or_create_job tests.
+                patch("pdf_pipeline.check_or_create_job"),
+                patch("pdf_pipeline.inspect_page", return_value=inspection),
+                patch("pdf_pipeline.render_page", return_value=raster),
+                patch(
+                    "pdf_pipeline.tesseract_page",
+                    side_effect=AssertionError("primary Surya route must bypass Tesseract"),
+                ),
+                patch("pdf_pipeline.surya_batch", return_value=prediction) as surya_batch,
+            ):
+                summary = process_document(
+                    pdf_path,
+                    input_root=root,
+                    output_root=root / "output",
+                    config=PipelineConfig(language="hin"),
+                )
+
+            self.assertEqual(summary["surya_primary_pages"], 2)
+            surya_batch.assert_called_once()
+            self.assertEqual(
+                surya_batch.call_args.args[1],
+                job_dir / "surya" / "batch-000002",
+            )
+            self.assertEqual(surya_batch.call_args.args[0].name, "surya-input-000002")
+
+            records = {
+                record["page"]: record
+                for record in (
+                    json.loads(line)
+                    for line in (job_dir / "pages.jsonl").read_text(encoding="utf-8").splitlines()
+                )
+            }
+            self.assertEqual(records[1]["surya_batch"], 1)
+            self.assertEqual(records[2]["surya_batch"], 2)
+
+    def test_compact_only_mode_preserves_rejected_tesseract_as_unselected_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pdf_path = root / "compact.pdf"
+            document = fitz.open()
+            document.new_page()
+            document.save(pdf_path)
+            document.close()
+            raster = {
+                "raster_width": 800,
+                "raster_height": 1_000,
+                "pdf_bbox": [0, 0, 595, 842],
+                "dpi": 200,
+            }
+            inspection = {
+                "classification": "OCR_NEEDED",
+                "route": "tesseract",
+                "signals": {},
+                "native_text": "",
+            }
+            quality = {
+                "accepted": False,
+                "mean_word_confidence": 21.0,
+                "rejection_reasons": ["low_mean_confidence"],
+            }
+            with (
+                patch("pdf_pipeline.inspect_page", return_value=inspection),
+                patch("pdf_pipeline.render_page", return_value=raster),
+                patch(
+                    "pdf_pipeline.tesseract_page",
+                    return_value=("unreliable Hindi OCR", quality, [], []),
+                ) as tesseract_page_mock,
+                patch(
+                    "pdf_pipeline.surya_batch",
+                    side_effect=AssertionError("compact-only mode must not call Surya"),
+                ),
+            ):
+                summary = process_document(
+                    pdf_path,
+                    input_root=root,
+                    output_root=root / "output",
+                    config=PipelineConfig(language="hin", fallback_engine="none"),
+                )
+
+            self.assertEqual(summary["tesseract_rejected_no_fallback_pages"], 1)
+            self.assertEqual(summary["surya_escalated_pages"], 0)
+            tesseract_page_mock.assert_called_once()
+            job_dir = root / "output" / "compact"
+            record = json.loads((job_dir / "pages.jsonl").read_text(encoding="utf-8").strip())
+            self.assertEqual(record["engine"], "none")
+            self.assertEqual(record["outcome"], "tesseract_rejected_no_fallback")
+            self.assertEqual(record["text"], "")
+            self.assertEqual(record["tesseract_candidate"]["text"], "unreliable Hindi OCR")
+            self.assertNotIn("surya_batch", record)
+            self.assertFalse((job_dir / "surya").exists())
+            rich = json.loads((job_dir / "compact_rich.json").read_text(encoding="utf-8"))
+            self.assertEqual(rich["pages"][0]["authoritative"]["engine"], "none")
+            self.assertEqual(rich["pages"][0]["authoritative"]["text"], "")
+            self.assertFalse(rich["pages"][0]["layers"]["tesseract5"]["selected"])
+            self.assertFalse(rich["pages"][0]["layers"]["surya"]["attempted"])
+
+    def test_compact_only_cli_profile_disallows_structure_escalation(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "fixture.pdf",
+                "--language",
+                "script/Devanagari",
+                "--ocr-engine",
+                "tesseract",
+                "--fallback-engine",
+                "none",
+            ]
+        )
+        config = config_from_args(args)
+        self.assertEqual(config.language, "script/Devanagari")
+        self.assertEqual(config.ocr_engine, "tesseract")
+        self.assertEqual(config.fallback_engine, "none")
+        self.assertEqual(primary_ocr_engine(config), "tesseract")
+
+        incompatible = build_parser().parse_args(
+            ["fixture.pdf", "--fallback-engine", "none", "--structure-aware"]
+        )
+        with self.assertRaisesRegex(SystemExit, "structure-aware requires --fallback-engine surya"):
+            # ``main`` validates after parsing; preserve that contract here.
+            validate_args(incompatible)
+
+    def test_structure_aware_rejects_primary_surya_route(self) -> None:
+        with self.assertRaisesRegex(ValueError, "structure_aware"):
+            validate_pipeline_config(PipelineConfig(language="hin", structure_aware=True))
 
     def test_visual_only_surya_page_is_a_valid_quality_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             image_path = root / "page-000001.png"
-            pending = [_PendingSuryaPage(
-                page=1,
-                inspection={"classification": "SCANNED", "route": "tesseract", "signals": {}, "native_text": ""},
-                image_path=image_path,
-                quality={"accepted": False, "mean_word_confidence": 10.0},
-                raster={"raster_width": 800, "raster_height": 1_000, "pdf_bbox": [0, 0, 595, 842]},
-                tesseract_text="",
-                tesseract_words=[],
-                tesseract_blocks=[],
-                escalation_reason="quality",
-            )]
+            pending = [
+                _PendingSuryaPage(
+                    page=1,
+                    inspection={
+                        "classification": "SCANNED",
+                        "route": "tesseract",
+                        "signals": {},
+                        "native_text": "",
+                    },
+                    image_path=image_path,
+                    quality={"accepted": False, "mean_word_confidence": 10.0},
+                    raster={
+                        "raster_width": 800,
+                        "raster_height": 1_000,
+                        "pdf_bbox": [0, 0, 595, 842],
+                    },
+                    tesseract_text="",
+                    tesseract_words=[],
+                    tesseract_blocks=[],
+                    escalation_reason="quality",
+                )
+            ]
             visual_prediction = {
                 "page-000001.png": {
                     "text": "",
-                    "blocks": [{
-                        "block_type": "Figure",
-                        "type": "figure",
-                        "text": "",
-                        "retain_empty": True,
-                        "skipped": True,
-                        "bbox": [100, 120, 700, 760],
-                    }],
+                    "blocks": [
+                        {
+                            "block_type": "Figure",
+                            "type": "figure",
+                            "text": "",
+                            "retain_empty": True,
+                            "skipped": True,
+                            "bbox": [100, 120, 700, 760],
+                        }
+                    ],
                 },
             }
             records: dict[int, dict] = {}
@@ -486,19 +1086,33 @@ class PipelineUnitTests(unittest.TestCase):
     def test_blank_surya_page_is_a_valid_quality_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            pending = [_PendingSuryaPage(
-                page=1,
-                inspection={"classification": "SCANNED", "route": "tesseract", "signals": {}, "native_text": ""},
-                image_path=root / "page-000001.png",
-                quality={"accepted": False, "mean_word_confidence": 10.0},
-                raster={"raster_width": 800, "raster_height": 1_000, "pdf_bbox": [0, 0, 595, 842]},
-                tesseract_text="",
-                tesseract_words=[],
-                tesseract_blocks=[],
-                escalation_reason="quality",
-            )]
+            pending = [
+                _PendingSuryaPage(
+                    page=1,
+                    inspection={
+                        "classification": "SCANNED",
+                        "route": "tesseract",
+                        "signals": {},
+                        "native_text": "",
+                    },
+                    image_path=root / "page-000001.png",
+                    quality={"accepted": False, "mean_word_confidence": 10.0},
+                    raster={
+                        "raster_width": 800,
+                        "raster_height": 1_000,
+                        "pdf_bbox": [0, 0, 595, 842],
+                    },
+                    tesseract_text="",
+                    tesseract_words=[],
+                    tesseract_blocks=[],
+                    escalation_reason="quality",
+                )
+            ]
             records: dict[int, dict] = {}
-            with patch("pdf_pipeline.surya_batch", return_value={"page-000001.png": {"text": "", "blocks": []}}):
+            with patch(
+                "pdf_pipeline.surya_batch",
+                return_value={"page-000001.png": {"text": "", "blocks": []}},
+            ):
                 flush_surya(
                     pending,
                     batch_number=1,
@@ -516,27 +1130,29 @@ class ChandraAdapterUnitTests(unittest.TestCase):
     def test_html_page_and_block_text_are_normalized(self) -> None:
         result = {
             "json": {
-                "children": [{
-                    "block_type": "Page",
-                    "bbox": [0, 0, 600, 800],
-                    "children": [
-                        {
-                            "block_type": "SectionHeader",
-                            "bbox": [10, 10, 400, 30],
-                            "html": "<h1>101 INTRODUCTION</h1>",
-                        },
-                        {
-                            "block_type": "Text",
-                            "bbox": [10, 40, 500, 80],
-                            "html": "<p>Useful <b>body</b> text.</p>",
-                        },
-                        {
-                            "block_type": "Table",
-                            "bbox": [10, 90, 500, 150],
-                            "html": "<table><tr><th>Item</th><th>Value</th></tr><tr><td>A</td><td>10</td></tr></table>",
-                        },
-                    ],
-                }]
+                "children": [
+                    {
+                        "block_type": "Page",
+                        "bbox": [0, 0, 600, 800],
+                        "children": [
+                            {
+                                "block_type": "SectionHeader",
+                                "bbox": [10, 10, 400, 30],
+                                "html": "<h1>101 INTRODUCTION</h1>",
+                            },
+                            {
+                                "block_type": "Text",
+                                "bbox": [10, 40, 500, 80],
+                                "html": "<p>Useful <b>body</b> text.</p>",
+                            },
+                            {
+                                "block_type": "Table",
+                                "bbox": [10, 90, 500, 150],
+                                "html": "<table><tr><th>Item</th><th>Value</th></tr><tr><td>A</td><td>10</td></tr></table>",
+                            },
+                        ],
+                    }
+                ]
             }
         }
 
@@ -561,10 +1177,12 @@ class ChandraAdapterUnitTests(unittest.TestCase):
             "runtime": 1.25,
             "markdown": "# Saved markdown\n",
             "json": {
-                "children": [{
-                    "block_type": "Page",
-                    "children": [{"block_type": "Text", "html": "<p>Offline text.</p>"}],
-                }]
+                "children": [
+                    {
+                        "block_type": "Page",
+                        "children": [{"block_type": "Text", "html": "<p>Offline text.</p>"}],
+                    }
+                ]
             },
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -868,7 +1486,9 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
             [canonical_label(block["label"]) for block in blocks],
             ["section_heading", "paragraph", "table"],
         )
-        self.assertEqual(visual_description_labels(rich_page, "cascade"), ["figure", "chart", "image"])
+        self.assertEqual(
+            visual_description_labels(rich_page, "cascade"), ["figure", "chart", "image"]
+        )
         only_visual = {
             "authoritative": {
                 "text": "Do not fall back to this visual description",
@@ -878,17 +1498,31 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
         self.assertEqual(page_ocr_blocks(only_visual, "cascade"), [])
         self.assertEqual(
             page_ocr_blocks(
-                {"text": "Also exclude generic visual descriptions", "blocks": [{"block_type": "Picture", "text": "image"}]},
+                {
+                    "text": "Also exclude generic visual descriptions",
+                    "blocks": [{"block_type": "Picture", "text": "image"}],
+                },
                 "chandra",
             ),
             [],
         )
         self.assertEqual(
             page_ocr_blocks(
-                {"authoritative": {"text": "Selected fallback", "blocks": []}, "layers": {"pymupdf": {"text": "wrong"}}},
+                {
+                    "authoritative": {"text": "Selected fallback", "blocks": []},
+                    "layers": {"pymupdf": {"text": "wrong"}},
+                },
                 "cascade",
             ),
-            [{"text": "Selected fallback", "label": None, "bbox": None, "reading_order": 1, "geometry": None}],
+            [
+                {
+                    "text": "Selected fallback",
+                    "label": None,
+                    "bbox": None,
+                    "reading_order": 1,
+                    "geometry": None,
+                }
+            ],
         )
 
     def test_evaluator_joins_by_page_id_and_rejects_mismatches(self) -> None:
@@ -899,7 +1533,9 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
             [row[0] for row in aligned_pages(reference, structure, ocr)],
             [1, 2],
         )
-        with self.assertRaisesRegex(ValueError, r"OCR page IDs do not match reference: missing \[2\], unexpected \[3\]"):
+        with self.assertRaisesRegex(
+            ValueError, r"OCR page IDs do not match reference: missing \[2\], unexpected \[3\]"
+        ):
             aligned_pages(reference, structure, [{"page": 1}, {"page": 3}])
 
     def test_cascade_cli_handles_normalized_and_rich_artifacts(self) -> None:
@@ -917,23 +1553,30 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
             {"block_type": "SectionHeader", "type": "text", "text": "Heading", "reading_order": 2},
             {"block_type": "Text", "type": "text", "text": "Body", "reading_order": 3},
             {"block_type": "Table", "type": "text", "text": "Item Value", "reading_order": 4},
-            {"block_type": "Picture", "type": "text", "text": "Not in the silver text", "reading_order": 5},
+            {
+                "block_type": "Picture",
+                "type": "text",
+                "text": "Not in the silver text",
+                "reading_order": 5,
+            },
         ]
         rich = {
             "schema_version": "cascade-ocr/rich-v1",
             "engine": "cascade",
-            "pages": [{
-                "page": 1,
-                "authoritative": {
-                    "engine": "surya",
-                    "text": "Header Heading Body Item Value",
-                    "blocks": authoritative_blocks,
-                },
-                "layers": {
-                    "pymupdf": {"text": "unselected native text"},
-                    "tesseract5": {"text": "unselected OCR text"},
-                },
-            }],
+            "pages": [
+                {
+                    "page": 1,
+                    "authoritative": {
+                        "engine": "surya",
+                        "text": "Header Heading Body Item Value",
+                        "blocks": authoritative_blocks,
+                    },
+                    "layers": {
+                        "pymupdf": {"text": "unselected native text"},
+                        "tesseract5": {"text": "unselected OCR text"},
+                    },
+                }
+            ],
         }
         normalized = {
             "schema_version": "cascade-ocr/v1",
@@ -948,7 +1591,9 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
             rich_path = root / "document_rich.json"
             normalized_path = root / "document_cascade.json"
             output_dir = root / "evaluation"
-            reference_path.write_text(json.dumps({"pages": [{"page": 1, "text": "unused"}]}), encoding="utf-8")
+            reference_path.write_text(
+                json.dumps({"pages": [{"page": 1, "text": "unused"}]}), encoding="utf-8"
+            )
             structure_path.write_text(json.dumps({"pages": [structure_page]}), encoding="utf-8")
             rich_path.write_text(json.dumps(rich), encoding="utf-8")
             normalized_path.write_text(json.dumps(normalized), encoding="utf-8")
@@ -968,29 +1613,39 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
                     "argv",
                     [
                         "evaluate_ocr.py",
-                        "--reference", str(reference_path),
-                        "--structure", str(structure_path),
-                        "--engine", "cascade",
-                        "--ocr-json", str(rich_path),
-                        "--out-dir", str(output_dir),
+                        "--reference",
+                        str(reference_path),
+                        "--structure",
+                        str(structure_path),
+                        "--engine",
+                        "cascade",
+                        "--ocr-json",
+                        str(rich_path),
+                        "--out-dir",
+                        str(output_dir),
                     ],
                 ),
                 redirect_stdout(StringIO()),
             ):
                 self.assertIsNone(evaluate_ocr_main())
 
-            evaluation = json.loads((output_dir / "cascade_evaluation.json").read_text(encoding="utf-8"))
+            evaluation = json.loads(
+                (output_dir / "cascade_evaluation.json").read_text(encoding="utf-8")
+            )
             self.assertEqual(evaluation["aggregate"]["weighted_CER"], 0.0)
             self.assertEqual(evaluation["aggregate"]["weighted_WER"], 0.0)
             self.assertEqual(
                 evaluation["aggregate"]["method"],
                 "exact per-page Levenshtein distances / total reference units",
             )
-            self.assertEqual(evaluation["visual_description_blocks"], {
-                "text_scoring": "excluded",
-                "count": 1,
-                "by_type": {"picture": 1},
-            })
+            self.assertEqual(
+                evaluation["visual_description_blocks"],
+                {
+                    "text_scoring": "excluded",
+                    "count": 1,
+                    "by_type": {"picture": 1},
+                },
+            )
             self.assertEqual(evaluation["structure"][0]["per_type"]["table"]["f1"], 1.0)
             self.assertEqual(evaluation["structure"][0]["matching"]["matched_blocks"], 4)
             self.assertEqual(evaluation["reading_order"]["per_page"][0]["status"], "measured")
@@ -1003,10 +1658,12 @@ class CascadeEvaluationUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "invalid_rich.json"
             path.write_text(
-                json.dumps({
-                    "schema_version": "cascade-ocr/rich-v1",
-                    "pages": [{"page": 1, "layers": {"pymupdf": {"text": "must not score"}}}],
-                }),
+                json.dumps(
+                    {
+                        "schema_version": "cascade-ocr/rich-v1",
+                        "pages": [{"page": 1, "layers": {"pymupdf": {"text": "must not score"}}}],
+                    }
+                ),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "missing authoritative"):

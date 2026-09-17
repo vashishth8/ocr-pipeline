@@ -35,12 +35,14 @@ class HybridSuryaTextTests(unittest.TestCase):
             "engine": "tesseract5",
             "outcome": "tesseract_accepted",
             "text": "Plain OCR text",
-            "blocks": [{
-                "block_type": "Text",
-                "type": "text",
-                "text": "Plain OCR text",
-                "reading_order": 1,
-            }],
+            "blocks": [
+                {
+                    "block_type": "Text",
+                    "type": "text",
+                    "text": "Plain OCR text",
+                    "reading_order": 1,
+                }
+            ],
         }
         document = fitz.open()
         page = document.new_page()
@@ -54,11 +56,13 @@ class HybridSuryaTextTests(unittest.TestCase):
         document.close()
 
     def test_cli_can_keep_surya_text_on_structure_routes(self) -> None:
-        args = build_parser().parse_args([
-            "fixture.pdf",
-            "--structure-aware",
-            "--no-structure-hybrid-text",
-        ])
+        args = build_parser().parse_args(
+            [
+                "fixture.pdf",
+                "--structure-aware",
+                "--no-structure-hybrid-text",
+            ]
+        )
         config = config_from_args(args)
         self.assertTrue(config.structure_aware)
         self.assertFalse(config.structure_hybrid_text)
@@ -129,8 +133,20 @@ class HybridSuryaTextTests(unittest.TestCase):
 
     def test_hybrid_declines_partial_or_overlapping_regions(self) -> None:
         partial_blocks = [
-            {"block_type": "Text", "type": "text", "text": "Alpha", "bbox": [0, 0, 80, 20], "reading_order": 1},
-            {"block_type": "Text", "type": "text", "text": "Bravo", "bbox": [0, 30, 80, 50], "reading_order": 2},
+            {
+                "block_type": "Text",
+                "type": "text",
+                "text": "Alpha",
+                "bbox": [0, 0, 80, 20],
+                "reading_order": 1,
+            },
+            {
+                "block_type": "Text",
+                "type": "text",
+                "text": "Bravo",
+                "bbox": [0, 30, 80, 50],
+                "reading_order": 2,
+            },
         ]
         partial, partial_details = hybridize_surya_layout_with_tesseract(
             partial_blocks,
@@ -142,8 +158,20 @@ class HybridSuryaTextTests(unittest.TestCase):
         self.assertEqual([block["text"] for block in partial], ["Alpha", "Bravo"])
 
         overlapping_blocks = [
-            {"block_type": "Text", "type": "text", "text": "Alpha", "bbox": [0, 0, 100, 100], "reading_order": 1},
-            {"block_type": "SectionHeader", "type": "sectionheader", "text": "Alpha", "bbox": [0, 0, 60, 25], "reading_order": 2},
+            {
+                "block_type": "Text",
+                "type": "text",
+                "text": "Alpha",
+                "bbox": [0, 0, 100, 100],
+                "reading_order": 1,
+            },
+            {
+                "block_type": "SectionHeader",
+                "type": "sectionheader",
+                "text": "Alpha",
+                "bbox": [0, 0, 60, 25],
+                "reading_order": 2,
+            },
         ]
         overlapping, overlap_details = hybridize_surya_layout_with_tesseract(
             overlapping_blocks,
@@ -158,13 +186,15 @@ class HybridSuryaTextTests(unittest.TestCase):
         # The engines contain exactly the same cells, but Tesseract's global
         # word order is column-major. Recover visible row order before the
         # exact table-sequence check, rather than trusting that global order.
-        surya_blocks = [{
-            "block_type": "Table",
-            "type": "table",
-            "text": "A1 B1 A2 B2",
-            "bbox": [0, 0, 120, 80],
-            "reading_order": 1,
-        }]
+        surya_blocks = [
+            {
+                "block_type": "Table",
+                "type": "table",
+                "text": "A1 B1 A2 B2",
+                "bbox": [0, 0, 120, 80],
+                "reading_order": 1,
+            }
+        ]
         tesseract_words = [
             word("A1", [5, 5, 25, 20], 1),
             word("A2", [5, 45, 25, 60], 2),
@@ -187,13 +217,15 @@ class HybridSuryaTextTests(unittest.TestCase):
 
     def test_hybrid_declines_table_with_nonidentical_sequence_or_signed_value(self) -> None:
         reordered, reordered_details = hybridize_surya_layout_with_tesseract(
-            [{
-                "block_type": "Table",
-                "type": "table",
-                "text": "A B C D E",
-                "bbox": [0, 0, 160, 30],
-                "reading_order": 1,
-            }],
+            [
+                {
+                    "block_type": "Table",
+                    "type": "table",
+                    "text": "A B C D E",
+                    "bbox": [0, 0, 160, 30],
+                    "reading_order": 1,
+                }
+            ],
             [
                 word("A", [5, 5, 15, 20], 1),
                 word("C", [25, 5, 35, 20], 2),
@@ -204,13 +236,15 @@ class HybridSuryaTextTests(unittest.TestCase):
             confident_word_threshold=60.0,
         )
         signed, signed_details = hybridize_surya_layout_with_tesseract(
-            [{
-                "block_type": "Text",
-                "type": "text",
-                "text": "Balance -100",
-                "bbox": [0, 0, 160, 30],
-                "reading_order": 1,
-            }],
+            [
+                {
+                    "block_type": "Text",
+                    "type": "text",
+                    "text": "Balance -100",
+                    "bbox": [0, 0, 160, 30],
+                    "reading_order": 1,
+                }
+            ],
             [
                 word("Balance", [5, 5, 55, 20], 1),
                 word("100", [65, 5, 85, 20], 2),
@@ -233,13 +267,15 @@ class HybridSuryaTextTests(unittest.TestCase):
 
     def test_hybrid_declines_when_any_canonical_surya_token_is_missing(self) -> None:
         blocks, details = hybridize_surya_layout_with_tesseract(
-            [{
-                "block_type": "Text",
-                "type": "text",
-                "text": "one two three four five six seven eight nine ten",
-                "bbox": [0, 0, 300, 30],
-                "reading_order": 1,
-            }],
+            [
+                {
+                    "block_type": "Text",
+                    "type": "text",
+                    "text": "one two three four five six seven eight nine ten",
+                    "bbox": [0, 0, 300, 30],
+                    "reading_order": 1,
+                }
+            ],
             [
                 word(text, [index * 25, 5, index * 25 + 20, 20], index)
                 for index, text in enumerate(
@@ -256,13 +292,15 @@ class HybridSuryaTextTests(unittest.TestCase):
 
     def test_hybrid_declines_high_confidence_word_outside_surya_regions(self) -> None:
         blocks, details = hybridize_surya_layout_with_tesseract(
-            [{
-                "block_type": "Text",
-                "type": "text",
-                "text": "Alpha",
-                "bbox": [0, 0, 100, 30],
-                "reading_order": 1,
-            }],
+            [
+                {
+                    "block_type": "Text",
+                    "type": "text",
+                    "text": "Alpha",
+                    "bbox": [0, 0, 100, 30],
+                    "reading_order": 1,
+                }
+            ],
             [
                 word("Alpha", [5, 5, 35, 20], 1),
                 word("outside", [150, 5, 200, 20], 2),
@@ -278,8 +316,20 @@ class HybridSuryaTextTests(unittest.TestCase):
     def test_hybrid_declines_visual_surya_text(self) -> None:
         blocks, details = hybridize_surya_layout_with_tesseract(
             [
-                {"block_type": "Text", "type": "text", "text": "Body", "bbox": [0, 0, 100, 20], "reading_order": 1},
-                {"block_type": "Figure", "type": "figure", "text": "Surya visual description", "bbox": [0, 30, 100, 80], "reading_order": 2},
+                {
+                    "block_type": "Text",
+                    "type": "text",
+                    "text": "Body",
+                    "bbox": [0, 0, 100, 20],
+                    "reading_order": 1,
+                },
+                {
+                    "block_type": "Figure",
+                    "type": "figure",
+                    "text": "Surya visual description",
+                    "bbox": [0, 30, 100, 80],
+                    "reading_order": 2,
+                },
             ],
             [word("Body", [5, 2, 35, 17], 1)],
             confident_word_threshold=60.0,
@@ -294,10 +344,19 @@ class HybridSuryaTextTests(unittest.TestCase):
             pending = [
                 _PendingSuryaPage(
                     page=1,
-                    inspection={"classification": "SCANNED", "route": "tesseract", "signals": {}, "native_text": ""},
+                    inspection={
+                        "classification": "SCANNED",
+                        "route": "tesseract",
+                        "signals": {},
+                        "native_text": "",
+                    },
                     image_path=root / "page-000001.png",
                     quality={"accepted": True, "mean_word_confidence": 95.0},
-                    raster={"raster_width": 100, "raster_height": 100, "pdf_bbox": [0, 0, 100, 100]},
+                    raster={
+                        "raster_width": 100,
+                        "raster_height": 100,
+                        "pdf_bbox": [0, 0, 100, 100],
+                    },
                     tesseract_text="Reliable table words source",
                     tesseract_words=[
                         word("Reliable", [5, 5, 45, 20], 1),
@@ -313,14 +372,16 @@ class HybridSuryaTextTests(unittest.TestCase):
             prediction = {
                 "page-000001.png": {
                     "text": "Reliable table words source",
-                    "blocks": [{
-                        "block_type": "Table",
-                        "type": "table",
-                        "text": "Reliable table words source",
-                        "bbox": [0, 0, 100, 60],
-                        "reading_order": 1,
-                        "html": "<table><tr><td>Reliable table words source</td></tr></table>",
-                    }],
+                    "blocks": [
+                        {
+                            "block_type": "Table",
+                            "type": "table",
+                            "text": "Reliable table words source",
+                            "bbox": [0, 0, 100, 60],
+                            "reading_order": 1,
+                            "html": "<table><tr><td>Reliable table words source</td></tr></table>",
+                        }
+                    ],
                 }
             }
             records = {}
@@ -338,7 +399,9 @@ class HybridSuryaTextTests(unittest.TestCase):
             self.assertEqual(record["text"], "Reliable table words source")
             self.assertTrue(record["hybrid_text"]["applied"])
             self.assertEqual(record["surya_candidate"]["text"], "Reliable table words source")
-            self.assertEqual(record["surya_candidate"]["blocks"][0]["text"], "Reliable table words source")
+            self.assertEqual(
+                record["surya_candidate"]["blocks"][0]["text"], "Reliable table words source"
+            )
             self.assertEqual(record["blocks"][0]["text_engine"], "tesseract5")
             self.assertFalse(tesseract_layer(record)["selected"])
             self.assertFalse(tesseract_layer(record)["selected_text"])
@@ -354,7 +417,9 @@ class HybridSuryaTextTests(unittest.TestCase):
             self.assertEqual(rich["authoritative"]["layout_engine"], "surya")
             self.assertEqual(rich["authoritative"]["text_engine"], "tesseract5")
             self.assertEqual(rich["layers"]["surya"]["text"], "Reliable table words source")
-            self.assertEqual(rich["authoritative"]["blocks"][0]["text"], "Reliable table words source")
+            self.assertEqual(
+                rich["authoritative"]["blocks"][0]["text"], "Reliable table words source"
+            )
             document.close()
 
     def test_hybrid_marks_only_reconstructed_authoritative_text_as_selected(self) -> None:
@@ -363,14 +428,16 @@ class HybridSuryaTextTests(unittest.TestCase):
             "engine": "surya",
             "outcome": "surya_escalated",
             "text": "A1 B1 A2 B2",
-            "blocks": [{
-                "block_type": "Table",
-                "type": "table",
-                "text": "A1 B1 A2 B2",
-                "reading_order": 1,
-                "layout_engine": "surya",
-                "text_engine": "tesseract5",
-            }],
+            "blocks": [
+                {
+                    "block_type": "Table",
+                    "type": "table",
+                    "text": "A1 B1 A2 B2",
+                    "reading_order": 1,
+                    "layout_engine": "surya",
+                    "text_engine": "tesseract5",
+                }
+            ],
             "hybrid_text": {"applied": True},
             "tesseract_candidate": {
                 "text": "A1 A2 B1 B2",
@@ -405,12 +472,24 @@ class HybridSuryaTextTests(unittest.TestCase):
             pending = [
                 _PendingSuryaPage(
                     page=1,
-                    inspection={"classification": "SCANNED", "route": "tesseract", "signals": {}, "native_text": ""},
+                    inspection={
+                        "classification": "SCANNED",
+                        "route": "tesseract",
+                        "signals": {},
+                        "native_text": "",
+                    },
                     image_path=root / "page-000001.png",
                     quality={"accepted": False, "mean_word_confidence": 10.0},
-                    raster={"raster_width": 100, "raster_height": 100, "pdf_bbox": [0, 0, 100, 100]},
+                    raster={
+                        "raster_width": 100,
+                        "raster_height": 100,
+                        "pdf_bbox": [0, 0, 100, 100],
+                    },
                     tesseract_text="Do not use this",
-                    tesseract_words=[word("Do", [5, 5, 20, 20], 1), word("not", [25, 5, 45, 20], 2)],
+                    tesseract_words=[
+                        word("Do", [5, 5, 20, 20], 1),
+                        word("not", [25, 5, 45, 20], 2),
+                    ],
                     tesseract_blocks=[],
                     escalation_reason="quality",
                 )
@@ -418,13 +497,15 @@ class HybridSuryaTextTests(unittest.TestCase):
             prediction = {
                 "page-000001.png": {
                     "text": "Surya is authoritative",
-                    "blocks": [{
-                        "block_type": "Text",
-                        "type": "text",
-                        "text": "Surya is authoritative",
-                        "bbox": [0, 0, 100, 60],
-                        "reading_order": 1,
-                    }],
+                    "blocks": [
+                        {
+                            "block_type": "Text",
+                            "type": "text",
+                            "text": "Surya is authoritative",
+                            "bbox": [0, 0, 100, 60],
+                            "reading_order": 1,
+                        }
+                    ],
                 }
             }
             records = {}
@@ -446,30 +527,61 @@ class HybridSuryaTextTests(unittest.TestCase):
     def test_declined_structure_hybrid_is_recorded_as_pure_surya(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            pending = [_PendingSuryaPage(
-                page=1,
-                inspection={"classification": "SCANNED", "route": "tesseract", "signals": {}, "native_text": ""},
-                image_path=root / "page-000001.png",
-                quality={"accepted": True, "mean_word_confidence": 95.0},
-                raster={"raster_width": 100, "raster_height": 100, "pdf_bbox": [0, 0, 100, 100]},
-                tesseract_text="Different words",
-                tesseract_words=[word("Different", [5, 5, 45, 20], 1), word("words", [50, 5, 80, 20], 2)],
-                tesseract_blocks=[],
-                escalation_reason="structure",
-                structure_gate={"enabled": True, "escalate": True},
-            )]
-            prediction = {"page-000001.png": {"text": "Surya-only region", "blocks": [{
-                "block_type": "Text", "type": "text", "text": "Surya-only region", "bbox": [0, 0, 100, 60], "reading_order": 1,
-            }]}}
+            pending = [
+                _PendingSuryaPage(
+                    page=1,
+                    inspection={
+                        "classification": "SCANNED",
+                        "route": "tesseract",
+                        "signals": {},
+                        "native_text": "",
+                    },
+                    image_path=root / "page-000001.png",
+                    quality={"accepted": True, "mean_word_confidence": 95.0},
+                    raster={
+                        "raster_width": 100,
+                        "raster_height": 100,
+                        "pdf_bbox": [0, 0, 100, 100],
+                    },
+                    tesseract_text="Different words",
+                    tesseract_words=[
+                        word("Different", [5, 5, 45, 20], 1),
+                        word("words", [50, 5, 80, 20], 2),
+                    ],
+                    tesseract_blocks=[],
+                    escalation_reason="structure",
+                    structure_gate={"enabled": True, "escalate": True},
+                )
+            ]
+            prediction = {
+                "page-000001.png": {
+                    "text": "Surya-only region",
+                    "blocks": [
+                        {
+                            "block_type": "Text",
+                            "type": "text",
+                            "text": "Surya-only region",
+                            "bbox": [0, 0, 100, 60],
+                            "reading_order": 1,
+                        }
+                    ],
+                }
+            }
             records = {}
             with patch("pdf_pipeline.surya_batch", return_value=prediction):
                 flush_surya(
-                    pending, batch_number=1, job_dir=root, config=PipelineConfig(structure_aware=True),
-                    manifest_path=root / "pages.jsonl", records=records,
+                    pending,
+                    batch_number=1,
+                    job_dir=root,
+                    config=PipelineConfig(structure_aware=True),
+                    manifest_path=root / "pages.jsonl",
+                    records=records,
                 )
             record = records[1]
             self.assertFalse(record["hybrid_text"]["applied"])
-            self.assertEqual(record["hybrid_text"]["skip_reason"], "insufficient_per_region_agreement")
+            self.assertEqual(
+                record["hybrid_text"]["skip_reason"], "insufficient_per_region_agreement"
+            )
             self.assertEqual(record["text"], "Surya-only region")
             self.assertFalse(tesseract_layer(record)["selected_text"])
             self.assertTrue(surya_layer(record)["selected_text"])
