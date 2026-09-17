@@ -30,7 +30,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import unicodedata
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
@@ -40,7 +39,18 @@ from pathlib import Path
 from statistics import fmean, median
 from typing import Any
 
-from sttl.gates import PipelineConfig, language_requests_hindi, primary_ocr_engine
+from sttl.gates import (
+    PipelineConfig,
+    _unicode_word_tokens,
+    classify_page_signals,
+    garbage_ratio,
+    language_requests_hindi,
+    pipeline_description,
+    plausible_word_ratio,
+    primary_ocr_engine,
+    private_use_character_count,
+    tesseract_quality,
+)
 from sttl.geometry import (
     PDF_POINT_FRAME,
     coerce_bbox,
@@ -59,7 +69,18 @@ from sttl.reporting import (
 from sttl.text import html_to_text, normalize_whitespace
 from sttl.version import PIPELINE_VERSION
 
-__all__ = ["scale_bbox_to_pdf_points", "scale_polygon_to_pdf_points"]
+__all__ = [
+    "classify_page_signals",
+    "garbage_ratio",
+    "pipeline_description",
+    "plausible_word_ratio",
+    "private_use_character_count",
+    "scale_bbox_to_pdf_points",
+    "scale_polygon_to_pdf_points",
+    "summarise_document",
+    "summarize_document",
+    "tesseract_quality",
+]
 
 try:
     import pymupdf as fitz
@@ -206,75 +227,6 @@ def html_to_table(value: Any) -> dict[str, Any] | None:
     return parser.tables[0] if parser.tables else None
 
 
-def garbage_ratio(value: str) -> float:
-    characters = [char for char in value if not char.isspace()]
-    if not characters:
-        return 0.0
-    garbage = sum(
-        char == "\ufffd" or not char.isprintable() or ord(char) < 32 for char in characters
-    )
-    return garbage / len(characters)
-
-
-def private_use_character_count(value: str) -> int:
-    """Record non-whitespace private-use glyphs as a diagnostic signal.
-
-    A PDF may use these Unicode code points for a custom font instead of real
-    characters. The count itself is diagnostic, while these non-printable
-    glyphs also contribute to the generic garbage ratio; a strict zero-garbage
-    profile therefore routes them to OCR without a separate special case.
-    """
-    return sum(unicodedata.category(char) == "Co" for char in value if not char.isspace())
-
-
-def _unicode_word_char(char: str) -> bool:
-    """Return whether a character belongs to a Unicode word token.
-
-    Python's ``str.isalnum`` and regular-expression ``\\w`` deliberately
-    exclude combining marks.  Those marks carry essential vowel, virama, and
-    nasalization information in Devanagari, so dropping them would make Hindi
-    OCR quality checks and inter-engine comparisons incorrect.
-    """
-    return char == "_" or char.isalnum() or unicodedata.category(char).startswith("M")
-
-
-def _unicode_word_tokens(value: str) -> list[str]:
-    """Split text into word tokens without discarding combining marks."""
-    tokens: list[str] = []
-    current: list[str] = []
-    for char in unicodedata.normalize("NFC", value):
-        if _unicode_word_char(char):
-            current.append(char)
-        elif current:
-            tokens.append("".join(current))
-            current = []
-    if current:
-        tokens.append("".join(current))
-    return tokens
-
-
-def plausible_word_ratio(value: str) -> float:
-    """Language-neutral sanity check; no English dictionary is assumed."""
-    tokens = re.findall(r"\S+", value)
-    if not tokens:
-        return 0.0
-    plausible = 0
-    for token in tokens:
-        # Include Devanagari danda punctuation here.  It is commonly attached
-        # to a word, and treating it as garbage would make a short but valid
-        # Hindi token fail the same quality gate that protects OCR routing.
-        symbols = sum(
-            not (_unicode_word_char(char) or char in "'_-.,:/()[]{}%+*=#।॥") for char in token
-        )
-        if (
-            any(char.isalnum() for char in token)
-            and len(token) <= 64
-            and symbols / len(token) <= 0.30
-        ):
-            plausible += 1
-    return plausible / len(tokens)
-
-
 def image_signals(page: fitz.Page) -> tuple[int, float]:
     """Cheap, conservative image coverage signal from PyMuPDF metadata."""
     page_area = page.rect.width * page.rect.height
@@ -292,58 +244,6 @@ def image_signals(page: fitz.Page) -> tuple[int, float]:
         image_area += bbox.width * bbox.height
     # Images may overlap.  This is an upper-bound signal, not exact coverage.
     return image_count, min(1.0, image_area / page_area)
-
-
-def classify_page_signals(
-    *,
-    text: str,
-    text_block_count: int,
-    image_count: int,
-    image_area_ratio: float,
-    config: PipelineConfig,
-) -> dict[str, Any]:
-    """Classify without rendering the page.
-
-    A page with usable native text and a dominant image is MIXED.  It receives
-    cheap OCR because native extraction alone can omit content inside the image.
-    """
-    native_text = normalize_whitespace(text)
-    text_chars = len(native_text)
-    word_count = len(re.findall(r"\S+", native_text))
-    native_garbage = garbage_ratio(native_text)
-    native_private_use = private_use_character_count(native_text)
-    usable = (
-        text_chars >= config.min_native_chars
-        and word_count >= config.min_native_words
-        and native_garbage <= config.max_native_garbage_ratio
-    )
-    image_dominant = image_area_ratio >= config.dominant_image_ratio
-    if usable and not image_dominant:
-        classification, route = "DIGITAL", "native_text"
-    elif usable:
-        # Do not merge native and OCR text here. A dominant image can contain
-        # material absent from the PDF text layer, so OCR becomes authoritative
-        # while the native layer remains provenance evidence.
-        classification, route = "MIXED", "tesseract"
-    elif image_count or image_dominant:
-        classification, route = "SCANNED", "tesseract"
-    else:
-        # This includes vector/outlined pages and broken or sparse text layers.
-        classification, route = "OCR_NEEDED", "tesseract"
-    return {
-        "classification": classification,
-        "route": route,
-        "native_text": native_text,
-        "signals": {
-            "native_text_chars": text_chars,
-            "native_word_count": word_count,
-            "native_text_block_count": text_block_count,
-            "native_garbage_ratio": round(native_garbage, 6),
-            "native_private_use_count": native_private_use,
-            "image_count": image_count,
-            "image_area_ratio": round(image_area_ratio, 6),
-        },
-    }
 
 
 def inspect_page(page: fitz.Page, config: PipelineConfig) -> dict[str, Any]:
@@ -928,60 +828,6 @@ def tesseract_structure_gate(
             "multi_column_pairs": multi_columns,
             "strict_native_tables": native_tables,
         },
-    }
-
-
-def tesseract_quality(
-    text: str, confidences: Sequence[float], config: PipelineConfig
-) -> dict[str, Any]:
-    """Decide whether cheap OCR is safe enough to accept.
-
-    A page must have enough material to be meaningful, reliable word-level
-    confidence, low corruption, and plausible tokens.  Any failed condition is
-    saved as a rejection reason and routes the page to Surya; this makes the
-    fallback decision reviewable and tuneable rather than a black box.
-    """
-    text = normalize_whitespace(text)
-    character_count = len(text)
-    word_count = len(re.findall(r"\S+", text))
-    mean_confidence = fmean(confidences) if confidences else None
-    confident_ratio = (
-        sum(value >= config.confident_word_threshold for value in confidences) / len(confidences)
-        if confidences
-        else 0.0
-    )
-    ocr_garbage = garbage_ratio(text)
-    plausibility = plausible_word_ratio(text)
-    rejected: list[str] = []
-    # Sparse output is commonly a blank/failed recognition result, even if its
-    # few detected words look confident.
-    if character_count < config.min_tesseract_chars:
-        rejected.append("too_few_characters")
-    if word_count < config.min_tesseract_words:
-        rejected.append("too_few_words")
-    # Tesseract's TSV confidence is our cheapest quality signal.  Both its
-    # mean and the share of individually confident words must pass.
-    if not confidences:
-        rejected.append("no_word_confidences")
-    elif mean_confidence is not None and mean_confidence < config.min_mean_confidence:
-        rejected.append("low_mean_confidence")
-    if confident_ratio < config.min_confident_word_ratio:
-        rejected.append("low_confident_word_ratio")
-    # Confidence alone can miss encoding noise or symbol-heavy gibberish.
-    if ocr_garbage > config.max_tesseract_garbage_ratio:
-        rejected.append("high_garbage_ratio")
-    if plausibility < config.min_plausible_word_ratio:
-        rejected.append("low_word_plausibility")
-    return {
-        "accepted": not rejected,
-        "rejection_reasons": rejected,
-        "text_chars": character_count,
-        "word_count": word_count,
-        "word_confidence_count": len(confidences),
-        "mean_word_confidence": round(mean_confidence, 3) if mean_confidence is not None else None,
-        "confident_word_ratio": round(confident_ratio, 6),
-        "garbage_ratio": round(ocr_garbage, 6),
-        "plausible_word_ratio": round(plausibility, 6),
     }
 
 
@@ -1754,7 +1600,7 @@ def make_record(
     return record
 
 
-def summarise_document(
+def summarize_document(
     pdf_path: Path,
     page_count: int,
     records: dict[int, dict[str, Any]],
@@ -1811,12 +1657,9 @@ def summarise_document(
     }
 
 
-def pipeline_description(config: PipelineConfig) -> str:
-    """Describe the configured route without implying an unused fallback."""
-    if primary_ocr_engine(config) == "surya":
-        return "PyMuPDF -> Surya OCR (primary route)"
-    fallback = "Surya fallback" if config.fallback_engine == "surya" else "no heavyweight fallback"
-    return f"PyMuPDF -> Tesseract 5 -> quality / optional structure gate -> {fallback}"
+# Retain the established British spelling for downstream scripts while making
+# the primary API consistent with the rest of the project naming convention.
+summarise_document = summarize_document
 
 
 def write_combined_text(path: Path, records: dict[int, dict[str, Any]], page_count: int) -> None:
@@ -2670,7 +2513,7 @@ def process_document(
                 if len(pending) >= config.surya_batch_size:
                     flush_pending()
         flush_pending()
-        summary = summarise_document(pdf_path, pdf.page_count, records, source=source)
+        summary = summarize_document(pdf_path, pdf.page_count, records, source=source)
     if summary["state"] == "complete":
         write_combined_text(job_dir / "combined.txt", records, summary["source_page_count"])
         # The normalized JSON is deliberately written only after every page is

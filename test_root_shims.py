@@ -39,6 +39,25 @@ class RootShimTests(unittest.TestCase):
         self.assertIs(pdf_pipeline.scale_bbox_to_pdf_points, scale_bbox_to_pdf_points)
         self.assertIs(pdf_pipeline.scale_polygon_to_pdf_points, scale_polygon_to_pdf_points)
 
+    def test_pipeline_shim_reexports_moved_gate_helpers(self) -> None:
+        import pdf_pipeline
+        from sttl import gates
+
+        for name in (
+            "classify_page_signals",
+            "garbage_ratio",
+            "pipeline_description",
+            "plausible_word_ratio",
+            "private_use_character_count",
+            "tesseract_quality",
+        ):
+            self.assertIs(getattr(pdf_pipeline, name), getattr(gates, name))
+
+    def test_pipeline_keeps_british_summary_alias(self) -> None:
+        import pdf_pipeline
+
+        self.assertIs(pdf_pipeline.summarise_document, pdf_pipeline.summarize_document)
+
     def test_report_result_is_not_used_as_a_process_exit_status(self) -> None:
         report_module = types.ModuleType("report_module")
         report_module.main = lambda: {"status": "ok"}

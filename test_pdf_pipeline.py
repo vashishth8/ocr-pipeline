@@ -264,6 +264,24 @@ class PipelineUnitTests(unittest.TestCase):
         self.assertFalse(quality["accepted"])
         self.assertIn("low_mean_confidence", quality["rejection_reasons"])
 
+    def test_quality_accepts_exact_configured_thresholds(self) -> None:
+        config = PipelineConfig(
+            min_tesseract_chars=4,
+            min_tesseract_words=1,
+            min_mean_confidence=60.0,
+            min_confident_word_ratio=1.0,
+            confident_word_threshold=60.0,
+            max_tesseract_garbage_ratio=0.0,
+            min_plausible_word_ratio=1.0,
+        )
+
+        accepted = tesseract_quality("word", [60.0], config)
+        rejected = tesseract_quality("word", [59.9], config)
+
+        self.assertTrue(accepted["accepted"], accepted)
+        self.assertFalse(rejected["accepted"])
+        self.assertIn("low_mean_confidence", rejected["rejection_reasons"])
+
     def test_surya_html_text(self) -> None:
         text = html_to_text(
             "<table><tr><th>Item</th><th>Value</th></tr><tr><td>A</td><td>10</td></tr></table>"

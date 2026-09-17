@@ -178,7 +178,7 @@ def expected_summary(records: dict[int, dict[str, Any]]) -> dict[str, Any]:
         and not isinstance(record["tesseract_quality"].get("mean_word_confidence"), bool)
     ]
     return {
-        # ``summarise_document`` deliberately preserves zero-valued states so
+        # ``summarize_document`` deliberately preserves zero-valued states so
         # dashboards can compare runs without adding missing keys.  Mirror
         # that canonical shape rather than comparing a sparse Counter.
         "classification_counts": {state: classifications.get(state, 0) for state in PAGE_STATES},
