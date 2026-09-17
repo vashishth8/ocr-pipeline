@@ -44,6 +44,7 @@ class RootShimTests(unittest.TestCase):
         from sttl import gates
 
         for name in (
+            "_unicode_word_char",
             "classify_page_signals",
             "garbage_ratio",
             "pipeline_description",
