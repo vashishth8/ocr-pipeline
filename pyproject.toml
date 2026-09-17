@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools==65.5.0", "wheel==0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sttl"
+description = "A resumable, page-aware PDF OCR pipeline"
+readme = "README.md"
+dynamic = ["version"]
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "beautifulsoup4>=4.12,<5",
+  "PyMuPDF>=1.23,<2",
+  "psutil>=5.9,<8",
+  "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "coverage[toml]>=7.6,<8",
+  "mypy>=1.13,<2",
+  "pre-commit>=4,<5",
+  "pytest>=8.3,<9",
+  "ruff>=0.8,<1",
+  "types-psutil>=7.0,<8",
+  "wheel>=0.45,<1",
+]
+ocr = ["surya-ocr==0.22.1"]
+
+[project.scripts]
+sttl = "sttl.pipeline:main"
+sttl-pipeline = "sttl.pipeline:main"
+sttl-benchmark = "sttl.benchmark:main"
+sttl-calibrate-tesseract-gate = "sttl.calibrate:cli"
+sttl-chandra = "sttl.chandra:main"
+sttl-compare = "sttl.compare:cli"
+sttl-evaluate = "sttl.evaluate:main"
+sttl-evaluate-routing = "sttl.routing:main"
+sttl-ground-truth = "sttl.ground_truth:main"
+sttl-metrics = "sttl.metrics_cli:main"
+sttl-verify-artifact = "sttl.verify:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "sttl.version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[tool.coverage.run]
+branch = true
+source = ["."]
+omit = ["test_*.py", "*/test_*.py", "sttl/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
